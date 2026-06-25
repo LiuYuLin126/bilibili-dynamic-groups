@@ -1,0 +1,8 @@
+node_modules/
+.output/
+.wxt/
+coverage/
+._*
+.DS_Store
+npm-debug.log*
+.claude/

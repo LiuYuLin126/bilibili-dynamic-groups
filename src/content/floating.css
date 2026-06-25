@@ -1,0 +1,33 @@
+#bili-dynamic-groups-fab {
+  align-items: center;
+  background: #008ac5;
+  border: none;
+  border-radius: 999px;
+  bottom: 24px;
+  box-shadow: 0 6px 18px rgba(0, 138, 197, 0.35);
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 6px;
+  padding: 10px 16px;
+  position: fixed;
+  right: 24px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  z-index: 2147483000;
+}
+
+#bili-dynamic-groups-fab:hover {
+  box-shadow: 0 8px 22px rgba(0, 138, 197, 0.45);
+  transform: translateY(-1px);
+}
+
+#bili-dynamic-groups-fab:active {
+  transform: translateY(0);
+}
+
+#bili-dynamic-groups-fab svg {
+  flex: 0 0 auto;
+}

@@ -1,0 +1,30 @@
+{
+  "name": "bili-dynamic-groups",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser extension for grouped Bilibili dynamic feeds with unread counts and update insights.",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@preact/preset-vite": "^2.10.2",
+    "dexie": "^4.0.11",
+    "js-md5": "^0.8.3",
+    "preact": "^10.26.9",
+    "wxt": "^0.20.6",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.317",
+    "@types/node": "^24.0.3",
+    "autoprefixer": "^10.4.22",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
