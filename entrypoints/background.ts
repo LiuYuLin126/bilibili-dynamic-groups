@@ -9,6 +9,7 @@ import {
   type Settings
 } from "@/src/shared/messages";
 import { runM1Sync } from "@/src/sync/sync";
+import { selectStaleDynamicIds } from "@/src/storage/retention";
 import type { DynamicRecord } from "@/src/types/domain";
 
 const api = new BilibiliApiClient();
@@ -31,7 +32,7 @@ export default defineBackground(() => {
       void runM1Sync(api);
     }
     if (alarm.name === "bili-groups-quadrants") {
-      void refreshQuadrants();
+      void runDailyMaintenance();
     }
     if (alarm.name === "bili-groups-space-sweep") {
       void runSpaceSweepBatch();
@@ -276,6 +277,32 @@ async function getUiState() {
   ]);
   const meta = Object.fromEntries(metaRows.map((row) => [row.key, row.value]));
   return { ups, groups, meta };
+}
+
+// Keep dynamics for 60 days, plus each UP's latest few even if older (so quiet UPs never
+// lose their most recent posts); view logs only feed the 30-day quadrants window.
+const DYNAMICS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+const DYNAMICS_KEEP_PER_UP = 10;
+const VIEWLOGS_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
+
+async function runDailyMaintenance() {
+  try {
+    await pruneOldData();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await db.syncMeta.put({ key: "last_prune_error", value: message, updatedAt: Date.now() });
+  }
+  await refreshQuadrants();
+}
+
+async function pruneOldData() {
+  const now = Date.now();
+  await db.viewLogs.where("ts").below(now - VIEWLOGS_RETENTION_MS).delete();
+
+  const all = await db.dynamics.toArray();
+  const toDelete = selectStaleDynamicIds(all, now - DYNAMICS_RETENTION_MS, DYNAMICS_KEEP_PER_UP);
+  if (toDelete.length) await db.dynamics.bulkDelete(toDelete);
+  await db.syncMeta.put({ key: "last_prune_at", value: now, updatedAt: now });
 }
 
 async function refreshQuadrants() {
