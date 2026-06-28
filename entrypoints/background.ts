@@ -10,6 +10,7 @@ import {
 } from "@/src/shared/messages";
 import { runM1Sync } from "@/src/sync/sync";
 import { selectStaleDynamicIds } from "@/src/storage/retention";
+import { getRecentLogs, logEvent, pruneLogs } from "@/src/storage/logs";
 import type { DynamicRecord } from "@/src/types/domain";
 
 const api = new BilibiliApiClient();
@@ -29,13 +30,18 @@ export default defineBackground(() => {
 
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "bili-groups-sync") {
-      void runM1Sync(api);
+      // runSyncLogged rethrows for the manual (awaited) path; in the alarm path the
+      // failure is already logged, so swallow it to avoid an unhandled rejection.
+      void runSyncLogged("定时").catch(() => {});
     }
     if (alarm.name === "bili-groups-quadrants") {
       void runDailyMaintenance();
     }
     if (alarm.name === "bili-groups-space-sweep") {
       void runSpaceSweepBatch();
+    }
+    if (alarm.name === "bili-groups-log-heartbeat") {
+      void logHeartbeat();
     }
   });
 
@@ -81,13 +87,17 @@ async function runGroupFetch(
   }
 
   let completed = 0;
+  let errors = 0;
+  const errorSamples = new Set<string>();
   for (const mid of targets) {
     if (isCancelled()) return;
     try {
       const items = await api.getSpaceDynamics(mid);
       await persistSpaceDynamics(mid, items);
     } catch (error) {
+      errors += 1;
       const message = error instanceof Error ? error.message : String(error);
+      errorSamples.add(message);
       tryPostMessage(port, { type: "warn", mid, error: message });
     }
     completed += 1;
@@ -102,6 +112,9 @@ async function runGroupFetch(
       })
     )
       return;
+  }
+  if (errors > 0) {
+    await logEvent("warn", "group-fetch", `打开分组补数 ${total} 个，失败 ${errors} 个`, [...errorSamples].slice(0, 3).join(" | "));
   }
   tryPostMessage(port, { type: "done", total, fresh: freshCount, skipped: skippedAfterCap });
 }
@@ -164,7 +177,7 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
     case "state:get":
       return { ok: true, data: await getUiState() };
     case "sync:m1":
-      await runM1Sync(api);
+      await runSyncLogged("手动");
       return { ok: true, data: await getUiState() };
     case "tracking:view":
       await db.viewLogs.add({ mid: message.mid, ts: Date.now(), source: message.source });
@@ -198,6 +211,8 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
     case "cache:reset":
       await resetDynamicsCache();
       return { ok: true, data: await getUiState() };
+    case "logs:get":
+      return { ok: true, data: await getRecentLogs(message.limit ?? 500) };
     default:
       return { ok: false, error: "Unsupported message type" };
   }
@@ -215,12 +230,16 @@ async function runSpaceSweepBatch() {
   const lastMid = typeof cursorMeta?.value === "number" ? cursorMeta.value : 0;
   let batch = ups.filter((up) => up.mid > lastMid).slice(0, SPACE_SWEEP_BATCH);
   if (batch.length === 0) batch = ups.slice(0, SPACE_SWEEP_BATCH);
+  let errors = 0;
+  const errorSamples = new Set<string>();
   for (const up of batch) {
     try {
       const items = await api.getSpaceDynamics(up.mid);
       await persistSpaceDynamics(up.mid, items);
-    } catch {
+    } catch (error) {
       // single UP failure shouldn't abort the sweep
+      errors += 1;
+      errorSamples.add(error instanceof Error ? error.message : String(error));
     }
   }
   const lastInBatch = batch[batch.length - 1];
@@ -228,6 +247,10 @@ async function runSpaceSweepBatch() {
   const now = Date.now();
   await db.syncMeta.put({ key: "space_sweep_cursor", value: nextCursor, updatedAt: now });
   await db.syncMeta.put({ key: "space_sweep_last_run", value: now, updatedAt: now });
+  // Only log failures — a clean sweep every 10 min would otherwise flood the log.
+  if (errors > 0) {
+    await logEvent("warn", "space-sweep", `后台补数 ${batch.length} 个，失败 ${errors} 个`, [...errorSamples].slice(0, 3).join(" | "));
+  }
 }
 
 async function openDashboardTab() {
@@ -285,14 +308,69 @@ const DYNAMICS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
 const DYNAMICS_KEEP_PER_UP = 10;
 const VIEWLOGS_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
 
+// Wraps the full sync so every run leaves a trail (start / success+counts / failure)
+// in the run log, on top of the existing syncMeta status fields.
+async function runSyncLogged(trigger: string) {
+  await logEvent("info", "sync", `同步开始（${trigger}）`);
+  try {
+    await runM1Sync(api);
+    const [ups, groups, dynamics] = await Promise.all([
+      db.ups.count(),
+      db.groups.count(),
+      db.dynamics.count()
+    ]);
+    await logEvent("info", "sync", `同步完成（${trigger}）`, { ups, groups, dynamics });
+  } catch (error) {
+    await logEvent("error", "sync", `同步失败（${trigger}）`, error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
+
+// Hourly snapshot of overall health so a report always has recent context even when
+// nothing failed.
+async function logHeartbeat() {
+  // Best-effort diagnostics: never let a DB hiccup here become an unhandled rejection
+  // (this runs from a fire-and-forget alarm).
+  try {
+    const [ups, groups, dynamics, viewLogs, logs, metaRows] = await Promise.all([
+      db.ups.count(),
+      db.groups.count(),
+      db.dynamics.count(),
+      db.viewLogs.count(),
+      db.logs.count(),
+      db.syncMeta.toArray()
+    ]);
+    const meta = Object.fromEntries(metaRows.map((row) => [row.key, row.value]));
+    await logEvent("info", "heartbeat", "每小时状态快照", {
+      ups,
+      groups,
+      dynamics,
+      viewLogs,
+      logs,
+      sync_status: meta.sync_status,
+      last_sync_at: meta.last_sync_at,
+      last_sync_error: meta.last_sync_error || "",
+      space_sweep_last_run: meta.space_sweep_last_run,
+      last_prune_at: meta.last_prune_at
+    });
+  } catch (error) {
+    console.error("[bili-dynamic-groups] heartbeat failed", error);
+  }
+}
+
 async function runDailyMaintenance() {
   try {
     await pruneOldData();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await db.syncMeta.put({ key: "last_prune_error", value: message, updatedAt: Date.now() });
+    await logEvent("error", "prune", "每日清理失败", message);
   }
-  await refreshQuadrants();
+  try {
+    await refreshQuadrants();
+  } catch (error) {
+    await logEvent("error", "quadrants", "四象限刷新失败", error instanceof Error ? error.message : String(error));
+  }
 }
 
 async function pruneOldData() {
@@ -302,7 +380,9 @@ async function pruneOldData() {
   const all = await db.dynamics.toArray();
   const toDelete = selectStaleDynamicIds(all, now - DYNAMICS_RETENTION_MS, DYNAMICS_KEEP_PER_UP);
   if (toDelete.length) await db.dynamics.bulkDelete(toDelete);
+  await pruneLogs(now);
   await db.syncMeta.put({ key: "last_prune_at", value: now, updatedAt: now });
+  await logEvent("info", "prune", `每日清理完成，删除动态 ${toDelete.length} 条`);
 }
 
 async function refreshQuadrants() {
@@ -339,4 +419,5 @@ async function ensureAlarms() {
   }
   if (!names.has("bili-groups-quadrants")) chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
   if (!names.has("bili-groups-space-sweep")) chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
+  if (!names.has("bili-groups-log-heartbeat")) chrome.alarms.create("bili-groups-log-heartbeat", { periodInMinutes: 60 });
 }

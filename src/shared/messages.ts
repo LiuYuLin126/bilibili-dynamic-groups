@@ -1,4 +1,4 @@
-import type { DynamicRecord, GroupRecord, QuadrantSnapshot, UpRecord, ViewSource } from "@/src/types/domain";
+import type { DynamicRecord, GroupRecord, QuadrantSnapshot, RunLogRecord, UpRecord, ViewSource } from "@/src/types/domain";
 
 export interface Settings {
   syncIntervalMinutes: number;
@@ -37,10 +37,11 @@ export type RuntimeRequest =
   | { type: "feed:get"; mids: number[]; limit?: number; before?: number; typeFilter?: "liveOnly" | "excludeLive" }
   | { type: "live:get" }
   | { type: "dashboard:open" }
-  | { type: "cache:reset" };
+  | { type: "cache:reset" }
+  | { type: "logs:get"; limit?: number };
 
 export type RuntimeResponse =
-  | { ok: true; data?: UiState | Settings | QuadrantSnapshot | DynamicRecord[] | unknown }
+  | { ok: true; data?: UiState | Settings | QuadrantSnapshot | DynamicRecord[] | RunLogRecord[] | unknown }
   | { ok: false; error: string };
 
 export type ContentDynamic = Pick<DynamicRecord, "dynamicId" | "mid" | "pubTs" | "summary">;

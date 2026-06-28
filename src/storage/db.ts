@@ -3,6 +3,7 @@ import type {
   DynamicRecord,
   GroupRecord,
   QuadrantSnapshot,
+  RunLogRecord,
   SyncMetaRecord,
   UpRecord,
   ViewLogRecord
@@ -15,6 +16,7 @@ export class BiliGroupsDatabase extends Dexie {
   viewLogs!: Table<ViewLogRecord, number>;
   quadrantSnapshots!: Table<QuadrantSnapshot, string>;
   syncMeta!: Table<SyncMetaRecord, string>;
+  logs!: Table<RunLogRecord, number>;
 
   constructor() {
     super("bili-dynamic-groups");
@@ -42,6 +44,10 @@ export class BiliGroupsDatabase extends Dexie {
         });
         await tx.table("quadrantSnapshots").clear();
       });
+    // v3 adds the run-log table (diagnostics time series); other tables carry over.
+    this.version(3).stores({
+      logs: "++id, ts, level, event"
+    });
   }
 }
 

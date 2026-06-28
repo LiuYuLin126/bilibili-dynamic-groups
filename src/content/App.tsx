@@ -3,7 +3,8 @@ import { resolveGroupMids, type GroupTab } from "@/src/content/domFilter";
 import { GroupFeed } from "@/src/content/GroupFeed";
 import { LiveFeed } from "@/src/content/LiveFeed";
 import { sendRuntimeMessage, type UiState } from "@/src/shared/messages";
-import type { GroupRecord, UpRecord } from "@/src/types/domain";
+import { formatLogsForReport } from "@/src/storage/logFormat";
+import type { GroupRecord, RunLogRecord, UpRecord } from "@/src/types/domain";
 
 type SortKey = "manual" | "latest" | "stale" | "updates";
 
@@ -14,6 +15,7 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [logExported, setLogExported] = useState(false);
   const [autoSyncAttempted, setAutoSyncAttempted] = useState(false);
   const tabsRef = useRef<HTMLDivElement | null>(null);
 
@@ -98,9 +100,35 @@ export default function App() {
         updatedUps: summary.updatedUps
       }
     };
-    await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch (err) {
+      setError(clipboardError(err));
+    }
+  }
+
+  async function exportLogs() {
+    try {
+      const logs = await sendRuntimeMessage<RunLogRecord[]>({ type: "logs:get", limit: 500 });
+      const report = [
+        "# Bili Dynamic Groups 运行日志",
+        `导出时间：${new Date().toLocaleString("zh-CN")}`,
+        `扩展版本：${chrome.runtime.getManifest().version}`,
+        `UA：${navigator.userAgent}`,
+        `统计：关注 ${state.ups.length} · 分组 ${state.groups.length} · 24h 更新 ${summary.update24h}`,
+        `最近同步：${state.meta.last_sync_at ? formatTime(Number(state.meta.last_sync_at)) : "—"} · 状态 ${String(state.meta.sync_status ?? "—")} · 错误 ${savedError || "无"}`,
+        "",
+        `## 日志（最近 ${logs.length} 条）`,
+        formatLogsForReport(logs) || "（暂无日志）"
+      ].join("\n");
+      await navigator.clipboard.writeText(report);
+      setLogExported(true);
+      window.setTimeout(() => setLogExported(false), 1400);
+    } catch (err) {
+      setError(clipboardError(err));
+    }
   }
 
   return (
@@ -163,6 +191,9 @@ export default function App() {
         {state.meta.last_sync_at ? <span>{formatTime(Number(state.meta.last_sync_at))}</span> : null}
         <button type="button" class="bdg-meta-btn" onClick={resetCache} title="清空动态缓存，下次进分组会重新拉取">
           重置缓存
+        </button>
+        <button type="button" class="bdg-meta-btn" onClick={exportLogs} title="复制最近的运行日志，反馈问题时连同文字描述一起发出">
+          {logExported ? "已复制日志" : "导出日志"}
         </button>
         {visibleError ? (
           <span class="bdg-error">
@@ -253,4 +284,11 @@ function formatTime(value: number) {
 
 function compactError(message: string) {
   return message.length > 96 ? `${message.slice(0, 96)}...` : message;
+}
+
+function clipboardError(err: unknown): string {
+  if (err instanceof Error && err.name === "NotAllowedError") {
+    return "复制失败：浏览器拒绝了剪贴板访问，请在页面获得焦点时重试";
+  }
+  return `操作失败：${err instanceof Error ? err.message : String(err)}`;
 }
