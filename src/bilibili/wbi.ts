@@ -32,7 +32,9 @@ export function signWbi(params: Record<string, string | number | undefined>, key
 }
 
 export function getMixinKey(original: string) {
-  return MIXIN_KEY_ENC_TAB.map((index) => original[index]).join("").slice(0, 32);
+  // `original[index]` is undefined if the key material is unexpectedly short; coerce to
+  // "" so we never feed `undefined` into the join (keeps output a defined string).
+  return MIXIN_KEY_ENC_TAB.map((index) => original[index] ?? "").join("").slice(0, 32);
 }
 
 export function extractWbiKey(url: string) {

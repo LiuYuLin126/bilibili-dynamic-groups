@@ -39,4 +39,17 @@ describe("calculateQuadrants", () => {
     expect(snapshot.items.find((item) => item.mid === 3)?.quadrant).toBe("quiet-view-frequent-update");
     expect(snapshot.items.find((item) => item.mid === 4)?.quadrant).toBe("quiet-view-quiet-update");
   });
+
+  it("treats scores equal to the median as quiet (uses > not >=)", () => {
+    const now = 1_700_000_000_000;
+    // No dynamics and no views → every view/update score is 0, so both medians are 0.
+    // With a >= boundary every UP would be misclassified as frequent on both axes.
+    const ups = [baseUp(1), baseUp(2), baseUp(3)];
+    const snapshot = calculateQuadrants(ups, [], [], now);
+    expect(snapshot.viewMedian).toBe(0);
+    expect(snapshot.updateMedian).toBe(0);
+    for (const item of snapshot.items) {
+      expect(item.quadrant).toBe("quiet-view-quiet-update");
+    }
+  });
 });

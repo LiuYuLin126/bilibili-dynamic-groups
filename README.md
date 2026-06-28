@@ -25,6 +25,10 @@ B 站原版动态页只有一条按时间倒序的混合流——粉一千个 UP
 
 ## 安装方式（开发者模式）
 
+> **环境要求**：Node **≥ 20.19**（或 ≥ 22.12，推荐 22 LTS）。低于此版本 `npm install` / `npm run build` 会失败——这是构建工具 Vite 7 的硬性要求，`package.json` 的 `engines` 字段会在版本不符时给出 `EBADENGINE` 警告。
+>
+> 仓库**不包含构建产物**（`.output/` 已被 `.gitignore` 排除）。clone 下来后**必须先在本机构建**，才能得到可加载的扩展目录。
+
 ```bash
 npm install
 npm run build
@@ -32,9 +36,11 @@ npm run build
 
 1. Chrome / Edge 地址栏访问 `chrome://extensions`
 2. 右上角打开"开发者模式"
-3. 点"加载已解压的扩展程序"，选 `.output/chrome-mv3` 目录
+3. 点"加载已解压的扩展程序"，选 **`.output/chrome-mv3`** 这个**子目录**（Windows 下是 `.output\chrome-mv3`）——**不要选仓库根目录**，根目录没有 `manifest.json`，会报"清单文件缺失或无法读取 / Manifest file is missing or unreadable"
 4. 装好后访问 `t.bilibili.com`，页面右下角会出现蓝色"分组"浮动按钮
 5. 点击浮动按钮 → 在新标签页打开主面板
+
+> 在另一台机器（如 Windows）上更新代码后，记得重新 `npm run build`，再到 `chrome://extensions` 点该扩展的"刷新"图标重新加载。
 
 ## 怎么用
 

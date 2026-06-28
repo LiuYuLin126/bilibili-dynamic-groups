@@ -61,7 +61,12 @@ function extractText(raw: unknown) {
 }
 
 function parseSuggestion(text: string, threshold: number): AiGroupSuggestion {
-  const parsed = JSON.parse(text) as { suggested_tagid?: number | null; confidence?: number; reason?: string };
+  let parsed: { suggested_tagid?: number | null; confidence?: number; reason?: string };
+  try {
+    parsed = JSON.parse(text) as { suggested_tagid?: number | null; confidence?: number; reason?: string };
+  } catch {
+    return { suggestedTagid: null, confidence: 0, reason: "AI response was not valid JSON." };
+  }
   const confidence = Number(parsed.confidence ?? 0);
   return {
     suggestedTagid: confidence >= threshold ? parsed.suggested_tagid ?? null : null,

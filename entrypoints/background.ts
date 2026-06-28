@@ -9,14 +9,22 @@ import {
   type Settings
 } from "@/src/shared/messages";
 import { runM1Sync } from "@/src/sync/sync";
+import { selectStaleDynamicIds } from "@/src/storage/retention";
+import type { DynamicRecord } from "@/src/types/domain";
 
 const api = new BilibiliApiClient();
 
 export default defineBackground(() => {
+  // Register alarms on every service-worker cold start, not only on install:
+  // onInstalled fires once, but the worker can be torn down and reloaded (browser
+  // restart, manual reload, update) without it firing again. ensureAlarms() only
+  // creates missing alarms, so it won't reset the schedule of existing ones.
+  void ensureAlarms();
   chrome.runtime.onInstalled.addListener(() => {
-    chrome.alarms.create("bili-groups-sync", { periodInMinutes: 60 });
-    chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
-    chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
+    void ensureAlarms();
+  });
+  chrome.runtime.onStartup.addListener(() => {
+    void ensureAlarms();
   });
 
   chrome.alarms.onAlarm.addListener((alarm) => {
@@ -24,7 +32,7 @@ export default defineBackground(() => {
       void runM1Sync(api);
     }
     if (alarm.name === "bili-groups-quadrants") {
-      void refreshQuadrants();
+      void runDailyMaintenance();
     }
     if (alarm.name === "bili-groups-space-sweep") {
       void runSpaceSweepBatch();
@@ -77,11 +85,7 @@ async function runGroupFetch(
     if (isCancelled()) return;
     try {
       const items = await api.getSpaceDynamics(mid);
-      if (items.length) {
-        await db.dynamics.bulkPut(items);
-        await recomputeUpdateCount24hForMid(mid);
-      }
-      await db.ups.update(mid, { lastSpaceFetchAt: Date.now() });
+      await persistSpaceDynamics(mid, items);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       tryPostMessage(port, { type: "warn", mid, error: message });
@@ -132,6 +136,20 @@ async function recomputeUpdateCount24hForMid(mid: number) {
   await db.ups.update(mid, { updateCount24h: count });
 }
 
+// Persist a single UP's freshly-fetched space dynamics atomically. Wrapping the
+// bulkPut + count recompute + cursor update in one transaction makes this serialize
+// against runM1Sync's transaction (which also locks ups+dynamics), so the two writers
+// can't interleave and clobber each other's updateCount24h.
+async function persistSpaceDynamics(mid: number, items: DynamicRecord[]) {
+  await db.transaction("rw", db.dynamics, db.ups, async () => {
+    if (items.length) {
+      await db.dynamics.bulkPut(items);
+      await recomputeUpdateCount24hForMid(mid);
+    }
+    await db.ups.update(mid, { lastSpaceFetchAt: Date.now() });
+  });
+}
+
 function tryPostMessage(port: chrome.runtime.Port, message: unknown): boolean {
   try {
     port.postMessage(message);
@@ -156,9 +174,15 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
       return { ok: true, data: await getQuadrantState() };
     case "settings:get":
       return { ok: true, data: await getSettings() };
-    case "settings:patch":
+    case "settings:patch": {
       await chrome.storage.sync.set({ settings: { ...(await getSettings()), ...message.patch } });
+      // Re-arm the full-sync alarm immediately when the user changes the interval.
+      if (message.patch.syncIntervalMinutes !== undefined) {
+        const next = await getSettings();
+        chrome.alarms.create("bili-groups-sync", { periodInMinutes: syncPeriodMinutes(next) });
+      }
       return { ok: true, data: await getSettings() };
+    }
     case "ai:suggest":
       return { ok: true, data: await suggestGroupForUp(message.mid, api, await getSettings()) };
     case "feed:get":
@@ -185,25 +209,24 @@ async function runSpaceSweepBatch() {
   const ups = await db.ups.orderBy("mid").toArray();
   if (ups.length === 0) return;
   const cursorMeta = await db.syncMeta.get("space_sweep_cursor");
-  let cursor = typeof cursorMeta?.value === "number" ? cursorMeta.value : 0;
-  if (cursor >= ups.length) cursor = 0;
-  const batch = ups.slice(cursor, cursor + SPACE_SWEEP_BATCH);
+  // Cursor is the last mid swept, not an array index. ups come back ascending by mid,
+  // so advancing by mid keeps the round-robin stable even when follows are added or
+  // removed between sweeps (an index cursor would skip or repeat UPs after reordering).
+  const lastMid = typeof cursorMeta?.value === "number" ? cursorMeta.value : 0;
+  let batch = ups.filter((up) => up.mid > lastMid).slice(0, SPACE_SWEEP_BATCH);
+  if (batch.length === 0) batch = ups.slice(0, SPACE_SWEEP_BATCH);
   for (const up of batch) {
     try {
       const items = await api.getSpaceDynamics(up.mid);
-      if (items.length) {
-        await db.dynamics.bulkPut(items);
-        await recomputeUpdateCount24hForMid(up.mid);
-      }
-      await db.ups.update(up.mid, { lastSpaceFetchAt: Date.now() });
+      await persistSpaceDynamics(up.mid, items);
     } catch {
       // single UP failure shouldn't abort the sweep
     }
   }
-  cursor += batch.length;
-  if (cursor >= ups.length) cursor = 0;
+  const lastInBatch = batch[batch.length - 1];
+  const nextCursor = lastInBatch ? lastInBatch.mid : 0;
   const now = Date.now();
-  await db.syncMeta.put({ key: "space_sweep_cursor", value: cursor, updatedAt: now });
+  await db.syncMeta.put({ key: "space_sweep_cursor", value: nextCursor, updatedAt: now });
   await db.syncMeta.put({ key: "space_sweep_last_run", value: now, updatedAt: now });
 }
 
@@ -256,6 +279,32 @@ async function getUiState() {
   return { ups, groups, meta };
 }
 
+// Keep dynamics for 60 days, plus each UP's latest few even if older (so quiet UPs never
+// lose their most recent posts); view logs only feed the 30-day quadrants window.
+const DYNAMICS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+const DYNAMICS_KEEP_PER_UP = 10;
+const VIEWLOGS_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
+
+async function runDailyMaintenance() {
+  try {
+    await pruneOldData();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await db.syncMeta.put({ key: "last_prune_error", value: message, updatedAt: Date.now() });
+  }
+  await refreshQuadrants();
+}
+
+async function pruneOldData() {
+  const now = Date.now();
+  await db.viewLogs.where("ts").below(now - VIEWLOGS_RETENTION_MS).delete();
+
+  const all = await db.dynamics.toArray();
+  const toDelete = selectStaleDynamicIds(all, now - DYNAMICS_RETENTION_MS, DYNAMICS_KEEP_PER_UP);
+  if (toDelete.length) await db.dynamics.bulkDelete(toDelete);
+  await db.syncMeta.put({ key: "last_prune_at", value: now, updatedAt: now });
+}
+
 async function refreshQuadrants() {
   const [ups, dynamics, viewLogs] = await Promise.all([
     db.ups.toArray(),
@@ -276,4 +325,18 @@ async function getQuadrantState() {
 async function getSettings(): Promise<Settings> {
   const { settings } = await chrome.storage.sync.get("settings");
   return { ...DEFAULT_SETTINGS, ...(settings ?? {}) };
+}
+
+function syncPeriodMinutes(settings: Settings) {
+  return Math.max(1, settings.syncIntervalMinutes || DEFAULT_SETTINGS.syncIntervalMinutes);
+}
+
+async function ensureAlarms() {
+  const existing = await chrome.alarms.getAll();
+  const names = new Set(existing.map((alarm) => alarm.name));
+  if (!names.has("bili-groups-sync")) {
+    chrome.alarms.create("bili-groups-sync", { periodInMinutes: syncPeriodMinutes(await getSettings()) });
+  }
+  if (!names.has("bili-groups-quadrants")) chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
+  if (!names.has("bili-groups-space-sweep")) chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
 }

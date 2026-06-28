@@ -491,6 +491,31 @@
   overflow: hidden;
 }
 
+.bdg-refresh-status {
+  align-items: center;
+  color: #8a94a6;
+  display: inline-flex;
+  flex: 1;
+  font-size: 12px;
+  gap: 8px;
+}
+
+.bdg-newitems {
+  align-self: center;
+  background: #008ac5;
+  border: none;
+  border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0, 138, 197, 0.3);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  margin: 4px auto 10px;
+  padding: 6px 18px;
+  position: sticky;
+  top: 8px;
+  z-index: 5;
+}
+
 @media (max-width: 720px) {
   #bili-dynamic-groups-root {
     margin: 8px;
