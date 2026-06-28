@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { DynamicCard } from "@/src/content/cards";
+import { RefreshStatus, useAutoRefresh } from "@/src/content/autoRefresh";
 import { sendRuntimeMessage } from "@/src/shared/messages";
 import type { DynamicRecord } from "@/src/types/domain";
 
 const FEED_PAGE_SIZE = 50;
+const LOCAL_REFRESH_MS = 60_000; // cheap re-read of the local DB
+const BACKFILL_REFRESH_MS = 5 * 60_000; // sparser, throttled network backfill of stale UPs
 
 interface FetchProgress {
   completed: number;
@@ -29,10 +32,66 @@ export function GroupFeed({
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState("");
   const [progress, setProgress] = useState<FetchProgress | null>(null);
+  const [pendingCount, setPendingCount] = useState(0);
+  const itemsRef = useRef<DynamicRecord[]>([]);
+  itemsRef.current = items;
   const itemCountRef = useRef(0);
   itemCountRef.current = items.length;
+  const pendingRef = useRef<DynamicRecord[] | null>(null);
+  const portRef = useRef<chrome.runtime.Port | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadMoreRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  const softRefreshRef = useRef<() => void>(() => {});
+
+  const buildRequest = (extras: { limit: number; before?: number }) => {
+    const payload: { type: "feed:get"; mids: number[]; limit: number; before?: number; typeFilter?: TypeFilter } = {
+      type: "feed:get",
+      mids,
+      limit: extras.limit
+    };
+    if (extras.before !== undefined) payload.before = extras.before;
+    if (typeFilter) payload.typeFilter = typeFilter;
+    return payload;
+  };
+
+  // Apply a freshly-read page without yanking the reader: if new items appeared while
+  // they're scrolled down, stash them and surface a pill instead of replacing the list
+  // under them. Near the top (or first load) we just apply directly.
+  const applyFresh = (fresh: DynamicRecord[], limit: number) => {
+    const prev = itemsRef.current;
+    const prevIds = new Set(prev.map((d) => d.dynamicId));
+    const newOnes = fresh.filter((d) => !prevIds.has(d.dynamicId));
+    const nearTop = window.scrollY < 200;
+    if (prev.length === 0 || newOnes.length === 0 || nearTop) {
+      setItems(fresh);
+      setHasMore(fresh.length === limit);
+      pendingRef.current = null;
+      setPendingCount(0);
+    } else {
+      pendingRef.current = fresh;
+      setPendingCount(newOnes.length);
+    }
+  };
+
+  const softRefresh = () => {
+    if (mids.length === 0) return;
+    const limit = Math.max(FEED_PAGE_SIZE, itemCountRef.current);
+    void sendRuntimeMessage<DynamicRecord[]>(buildRequest({ limit }))
+      .then((fresh) => applyFresh(fresh, limit))
+      .catch(() => {
+        /* a failed soft refresh is non-fatal; keep showing the current list */
+      });
+  };
+  softRefreshRef.current = softRefresh;
+
+  const applyPending = () => {
+    if (pendingRef.current) {
+      setItems(pendingRef.current);
+      pendingRef.current = null;
+    }
+    setPendingCount(0);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   useEffect(() => {
     if (mids.length === 0) {
@@ -41,11 +100,15 @@ export function GroupFeed({
       setHasMore(false);
       setError("");
       setProgress(null);
+      pendingRef.current = null;
+      setPendingCount(0);
       return;
     }
     setLoading(true);
     setError("");
     setHasMore(true);
+    setPendingCount(0);
+    pendingRef.current = null;
     setProgress({ completed: 0, total: 0, fresh: 0, skipped: 0 });
 
     // Guard against out-of-order responses: switching tabs re-runs this effect and
@@ -53,18 +116,7 @@ export function GroupFeed({
     // tab can no longer overwrite the current tab's state.
     let active = true;
 
-    const baseRequest = (extras: { limit: number; before?: number }) => {
-      const payload: { type: "feed:get"; mids: number[]; limit: number; before?: number; typeFilter?: TypeFilter } = {
-        type: "feed:get",
-        mids,
-        limit: extras.limit
-      };
-      if (extras.before !== undefined) payload.before = extras.before;
-      if (typeFilter) payload.typeFilter = typeFilter;
-      return payload;
-    };
-
-    sendRuntimeMessage<DynamicRecord[]>(baseRequest({ limit: FEED_PAGE_SIZE }))
+    sendRuntimeMessage<DynamicRecord[]>(buildRequest({ limit: FEED_PAGE_SIZE }))
       .then((data) => {
         if (!active) return;
         setItems(data);
@@ -78,15 +130,8 @@ export function GroupFeed({
       });
 
     const port = chrome.runtime.connect({ name: "group-feed" });
+    portRef.current = port;
     port.postMessage({ type: "start", mids });
-    const refetch = () => {
-      const limit = Math.max(FEED_PAGE_SIZE, itemCountRef.current);
-      void sendRuntimeMessage<DynamicRecord[]>(baseRequest({ limit })).then((fresh) => {
-        if (!active) return;
-        setItems(fresh);
-        setHasMore(fresh.length === limit);
-      });
-    };
     const onPortMessage = (msg: {
       type: string;
       completed?: number;
@@ -103,10 +148,10 @@ export function GroupFeed({
           fresh: msg.fresh ?? 0,
           skipped: msg.skipped ?? 0
         });
-        refetch();
+        softRefreshRef.current();
       } else if (msg.type === "done") {
         setProgress(null);
-        refetch();
+        softRefreshRef.current();
       } else if (msg.type === "warn" && msg.error) {
         setError(msg.error);
       }
@@ -116,6 +161,7 @@ export function GroupFeed({
       active = false;
       port.onMessage.removeListener(onPortMessage);
       port.disconnect();
+      portRef.current = null;
     };
   }, [tabKey, mids.length]);
 
@@ -125,14 +171,9 @@ export function GroupFeed({
     if (!oldest) return;
     setLoadingMore(true);
     try {
-      const payload: { type: "feed:get"; mids: number[]; limit: number; before: number; typeFilter?: TypeFilter } = {
-        type: "feed:get",
-        mids,
-        limit: FEED_PAGE_SIZE,
-        before: oldest.pubTs
-      };
-      if (typeFilter) payload.typeFilter = typeFilter;
-      const more = await sendRuntimeMessage<DynamicRecord[]>(payload);
+      const more = await sendRuntimeMessage<DynamicRecord[]>(
+        buildRequest({ limit: FEED_PAGE_SIZE, before: oldest.pubTs })
+      );
       setItems((prev) => [...prev, ...more]);
       setHasMore(more.length === FEED_PAGE_SIZE);
     } catch (err) {
@@ -158,6 +199,22 @@ export function GroupFeed({
     return () => observer.disconnect();
   }, [tabKey, mids.length]);
 
+  // Tier 1 — cheap local re-read that surfaces whatever the background sweep has added.
+  const localRefresh = useAutoRefresh(softRefresh, LOCAL_REFRESH_MS, mids.length > 0);
+  // Tier 2 — sparser, best-effort network backfill of stale UPs for this group, sent over
+  // the live port. If the worker is asleep the local re-read above still keeps the view moving.
+  useAutoRefresh(
+    () => {
+      try {
+        portRef.current?.postMessage({ type: "start", mids });
+      } catch {
+        /* port closed; the next tab open will reconnect */
+      }
+    },
+    BACKFILL_REFRESH_MS,
+    mids.length > 0
+  );
+
   if (mids.length === 0) {
     return <div class="bdg-feed-state">该分组暂无成员。</div>;
   }
@@ -177,7 +234,24 @@ export function GroupFeed({
 
   return (
     <div class="bdg-feed">
-      {progress ? <ProgressBar progress={progress} /> : null}
+      {progress ? (
+        <ProgressBar progress={progress} />
+      ) : (
+        <div class="bdg-feed-meta">
+          <RefreshStatus
+            lastRefreshedAt={localRefresh.lastRefreshedAt}
+            nextRefreshAt={localRefresh.nextRefreshAt}
+            onRefresh={softRefresh}
+            busy={loading}
+          />
+          {error ? <span class="bdg-feed-state--error">{error}</span> : null}
+        </div>
+      )}
+      {pendingCount > 0 ? (
+        <button type="button" class="bdg-newitems" onClick={applyPending}>
+          {pendingCount} 条新动态 ↑
+        </button>
+      ) : null}
       {items.map((item) => (
         <DynamicCard key={item.dynamicId} dynamic={item} />
       ))}

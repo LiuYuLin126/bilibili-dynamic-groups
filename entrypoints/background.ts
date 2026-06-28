@@ -173,9 +173,15 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
       return { ok: true, data: await getQuadrantState() };
     case "settings:get":
       return { ok: true, data: await getSettings() };
-    case "settings:patch":
+    case "settings:patch": {
       await chrome.storage.sync.set({ settings: { ...(await getSettings()), ...message.patch } });
+      // Re-arm the full-sync alarm immediately when the user changes the interval.
+      if (message.patch.syncIntervalMinutes !== undefined) {
+        const next = await getSettings();
+        chrome.alarms.create("bili-groups-sync", { periodInMinutes: syncPeriodMinutes(next) });
+      }
       return { ok: true, data: await getSettings() };
+    }
     case "ai:suggest":
       return { ok: true, data: await suggestGroupForUp(message.mid, api, await getSettings()) };
     case "feed:get":
@@ -294,10 +300,16 @@ async function getSettings(): Promise<Settings> {
   return { ...DEFAULT_SETTINGS, ...(settings ?? {}) };
 }
 
+function syncPeriodMinutes(settings: Settings) {
+  return Math.max(1, settings.syncIntervalMinutes || DEFAULT_SETTINGS.syncIntervalMinutes);
+}
+
 async function ensureAlarms() {
   const existing = await chrome.alarms.getAll();
   const names = new Set(existing.map((alarm) => alarm.name));
-  if (!names.has("bili-groups-sync")) chrome.alarms.create("bili-groups-sync", { periodInMinutes: 60 });
+  if (!names.has("bili-groups-sync")) {
+    chrome.alarms.create("bili-groups-sync", { periodInMinutes: syncPeriodMinutes(await getSettings()) });
+  }
   if (!names.has("bili-groups-quadrants")) chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
   if (!names.has("bili-groups-space-sweep")) chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
 }
