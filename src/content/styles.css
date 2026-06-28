@@ -197,6 +197,42 @@
   width: 18px;
 }
 
+.bdg-settings {
+  border: 1px solid #dde3ee;
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 4px 16px 12px;
+}
+
+.bdg-settings label {
+  align-items: center;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 140px minmax(0, 1fr);
+  margin: 12px 0;
+}
+
+.bdg-settings input {
+  background: #fff;
+  border: 1px solid #d9dee8;
+  border-radius: 6px;
+  color: #20242b;
+  height: 32px;
+  padding: 0 8px;
+}
+
+.bdg-settings input[type="checkbox"] {
+  height: 18px;
+  justify-self: start;
+  width: 18px;
+}
+
+.bdg-settings-saved {
+  color: #008ac5;
+  font-size: 12px;
+  margin: 6px 0 0;
+}
+
 .bdg-feed {
   display: flex;
   flex-direction: column;
@@ -498,6 +534,12 @@
   flex: 1;
   font-size: 12px;
   gap: 8px;
+}
+
+.bdg-sync-status {
+  align-items: center;
+  display: inline-flex;
+  gap: 2px;
 }
 
 .bdg-newitems {

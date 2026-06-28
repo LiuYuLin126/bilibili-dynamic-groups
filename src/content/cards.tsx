@@ -64,10 +64,14 @@ function DebugCopy({ raw }: { raw: string }) {
   const handleClick = (event: MouseEvent) => {
     event.preventDefault();
     event.stopPropagation();
-    void navigator.clipboard.writeText(raw).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1200);
-    });
+    void navigator.clipboard.writeText(raw)
+      .then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1200);
+      })
+      .catch(() => {
+        /* clipboard denied — nothing actionable from this small button */
+      });
   };
   return (
     <button

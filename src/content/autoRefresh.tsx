@@ -112,7 +112,7 @@ function relTime(ms: number) {
   return `${Math.round(minutes / 60)} 小时前`;
 }
 
-function formatCountdown(seconds: number) {
+export function formatCountdown(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return minutes > 0 ? `${minutes}:${rest.toString().padStart(2, "0")}` : `${rest}s`;

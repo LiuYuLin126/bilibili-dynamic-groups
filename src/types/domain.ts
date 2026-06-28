@@ -93,3 +93,14 @@ export interface AiGroupSuggestion {
   confidence: number;
   reason: string;
 }
+
+export type LogLevel = "info" | "warn" | "error";
+
+export interface RunLogRecord {
+  id?: number;
+  ts: number;
+  level: LogLevel;
+  event: string;
+  message: string;
+  detail?: string;
+}

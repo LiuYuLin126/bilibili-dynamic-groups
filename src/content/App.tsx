@@ -2,8 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveGroupMids, type GroupTab } from "@/src/content/domFilter";
 import { GroupFeed } from "@/src/content/GroupFeed";
 import { LiveFeed } from "@/src/content/LiveFeed";
-import { sendRuntimeMessage, type UiState } from "@/src/shared/messages";
-import type { GroupRecord, UpRecord } from "@/src/types/domain";
+import { SettingsForm } from "@/src/content/SettingsForm";
+import { sendRuntimeMessage, type Settings, type UiState } from "@/src/shared/messages";
+import { formatCountdown } from "@/src/content/autoRefresh";
+import { formatLogsForReport } from "@/src/storage/logFormat";
+import type { GroupRecord, RunLogRecord, UpRecord } from "@/src/types/domain";
 
 type SortKey = "manual" | "latest" | "stale" | "updates";
 
@@ -14,11 +17,34 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [logExported, setLogExported] = useState(false);
   const [autoSyncAttempted, setAutoSyncAttempted] = useState(false);
+  const [syncIntervalMin, setSyncIntervalMin] = useState(60);
+  const [showSettings, setShowSettings] = useState(false);
   const tabsRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void refreshState();
+  }, []);
+
+  useEffect(() => {
+    void sendRuntimeMessage<Settings>({ type: "settings:get" })
+      .then((settings) => setSyncIntervalMin(settings.syncIntervalMinutes || 60))
+      .catch(() => {});
+  }, []);
+
+  // Reflect background syncs when returning to the tab (refreshes last_sync_at, counts,
+  // and the sync countdown below).
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refreshState();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
   }, []);
 
   // Let a plain mouse wheel scroll the horizontally-overflowing tab strip. Without this
@@ -49,6 +75,7 @@ export default function App() {
   const groupMids = useMemo(() => resolveGroupMids(activeTab, state.ups), [activeTab, state.ups]);
   const savedError = typeof state.meta.last_sync_error === "string" ? state.meta.last_sync_error : "";
   const visibleError = error || savedError;
+  const lastSyncAt = typeof state.meta.last_sync_at === "number" ? state.meta.last_sync_at : null;
 
   async function refreshState() {
     try {
@@ -98,9 +125,35 @@ export default function App() {
         updatedUps: summary.updatedUps
       }
     };
-    await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch (err) {
+      setError(clipboardError(err));
+    }
+  }
+
+  async function exportLogs() {
+    try {
+      const logs = await sendRuntimeMessage<RunLogRecord[]>({ type: "logs:get", limit: 500 });
+      const report = [
+        "# Bili Dynamic Groups 运行日志",
+        `导出时间：${new Date().toLocaleString("zh-CN")}`,
+        `扩展版本：${chrome.runtime.getManifest().version}`,
+        `UA：${navigator.userAgent}`,
+        `统计：关注 ${state.ups.length} · 分组 ${state.groups.length} · 24h 更新 ${summary.update24h}`,
+        `最近同步：${state.meta.last_sync_at ? formatTime(Number(state.meta.last_sync_at)) : "—"} · 状态 ${String(state.meta.sync_status ?? "—")} · 错误 ${savedError || "无"}`,
+        "",
+        `## 日志（最近 ${logs.length} 条）`,
+        formatLogsForReport(logs) || "（暂无日志）"
+      ].join("\n");
+      await navigator.clipboard.writeText(report);
+      setLogExported(true);
+      window.setTimeout(() => setLogExported(false), 1400);
+    } catch (err) {
+      setError(clipboardError(err));
+    }
   }
 
   return (
@@ -154,15 +207,31 @@ export default function App() {
             <SyncIcon />
             <span>{syncing ? "同步中" : "同步"}</span>
           </button>
+          <button type="button" onClick={() => setShowSettings((open) => !open)} aria-expanded={showSettings}>
+            {showSettings ? "收起设置" : "设置"}
+          </button>
         </div>
       </div>
+      {showSettings ? (
+        <div class="bdg-settings">
+          <SettingsForm onChange={(next) => setSyncIntervalMin(next.syncIntervalMinutes || 60)} />
+        </div>
+      ) : null}
       <div class="bdg-meta">
         <span>{summary.updatedUps} 位有更新</span>
         <span>过去 24 小时 {summary.update24h} 条更新</span>
-        {syncing ? <span>正在同步</span> : null}
-        {state.meta.last_sync_at ? <span>{formatTime(Number(state.meta.last_sync_at))}</span> : null}
+        <SyncStatus
+          lastSyncAt={lastSyncAt}
+          intervalMs={Math.max(1, syncIntervalMin) * 60_000}
+          syncing={syncing}
+          syncStatusRunning={state.meta.sync_status === "running"}
+          onDue={() => void syncNow("定时")}
+        />
         <button type="button" class="bdg-meta-btn" onClick={resetCache} title="清空动态缓存，下次进分组会重新拉取">
           重置缓存
+        </button>
+        <button type="button" class="bdg-meta-btn" onClick={exportLogs} title="复制最近的运行日志，反馈问题时连同文字描述一起发出">
+          {logExported ? "已复制日志" : "导出日志"}
         </button>
         {visibleError ? (
           <span class="bdg-error">
@@ -200,6 +269,51 @@ function SyncIcon() {
       <path d="M3 12a9 9 0 0 0 15.5 6.3L21 16" />
       <path d="M21 20v-4h-4" />
     </svg>
+  );
+}
+
+// Shows "上次同步 X · 距下次 mm:ss" and drives a real sync when the schedule elapses while
+// the dashboard is open. Owns its own 1s tick so only this node re-renders each second.
+function SyncStatus({
+  lastSyncAt,
+  intervalMs,
+  syncing,
+  syncStatusRunning,
+  onDue
+}: {
+  lastSyncAt: number | null;
+  intervalMs: number;
+  syncing: boolean;
+  syncStatusRunning: boolean;
+  onDue: () => void;
+}) {
+  const [now, setNow] = useState(Date.now());
+  const firedForRef = useRef<number | null>(null);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const nextAt = lastSyncAt ? lastSyncAt + intervalMs : null;
+  const remaining = nextAt ? Math.max(0, Math.round((nextAt - now) / 1000)) : null;
+
+  useEffect(() => {
+    if (!nextAt || syncing || syncStatusRunning) return;
+    if (document.visibilityState !== "visible") return;
+    // Fire once per scheduled time; a successful sync advances lastSyncAt → nextAt, which
+    // re-arms this. A failed sync leaves lastSyncAt unchanged, so it won't spin-retry.
+    if (now >= nextAt && firedForRef.current !== nextAt) {
+      firedForRef.current = nextAt;
+      onDue();
+    }
+  }, [now, nextAt, syncing, syncStatusRunning, onDue]);
+
+  if (syncing) return <span class="bdg-sync-status">正在同步…</span>;
+  return (
+    <span class="bdg-sync-status">
+      {lastSyncAt ? <span>上次同步 {formatTime(lastSyncAt)}</span> : <span>尚未同步</span>}
+      {remaining !== null ? <span> · 距下次同步 {formatCountdown(remaining)}</span> : null}
+    </span>
   );
 }
 
@@ -253,4 +367,11 @@ function formatTime(value: number) {
 
 function compactError(message: string) {
   return message.length > 96 ? `${message.slice(0, 96)}...` : message;
+}
+
+function clipboardError(err: unknown): string {
+  if (err instanceof Error && err.name === "NotAllowedError") {
+    return "复制失败：浏览器拒绝了剪贴板访问，请在页面获得焦点时重试";
+  }
+  return `操作失败：${err instanceof Error ? err.message : String(err)}`;
 }
