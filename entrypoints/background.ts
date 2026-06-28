@@ -9,14 +9,21 @@ import {
   type Settings
 } from "@/src/shared/messages";
 import { runM1Sync } from "@/src/sync/sync";
+import type { DynamicRecord } from "@/src/types/domain";
 
 const api = new BilibiliApiClient();
 
 export default defineBackground(() => {
+  // Register alarms on every service-worker cold start, not only on install:
+  // onInstalled fires once, but the worker can be torn down and reloaded (browser
+  // restart, manual reload, update) without it firing again. ensureAlarms() only
+  // creates missing alarms, so it won't reset the schedule of existing ones.
+  void ensureAlarms();
   chrome.runtime.onInstalled.addListener(() => {
-    chrome.alarms.create("bili-groups-sync", { periodInMinutes: 60 });
-    chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
-    chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
+    void ensureAlarms();
+  });
+  chrome.runtime.onStartup.addListener(() => {
+    void ensureAlarms();
   });
 
   chrome.alarms.onAlarm.addListener((alarm) => {
@@ -77,11 +84,7 @@ async function runGroupFetch(
     if (isCancelled()) return;
     try {
       const items = await api.getSpaceDynamics(mid);
-      if (items.length) {
-        await db.dynamics.bulkPut(items);
-        await recomputeUpdateCount24hForMid(mid);
-      }
-      await db.ups.update(mid, { lastSpaceFetchAt: Date.now() });
+      await persistSpaceDynamics(mid, items);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       tryPostMessage(port, { type: "warn", mid, error: message });
@@ -130,6 +133,20 @@ async function recomputeUpdateCount24hForMid(mid: number) {
     .filter((d) => d.pubTs >= since)
     .count();
   await db.ups.update(mid, { updateCount24h: count });
+}
+
+// Persist a single UP's freshly-fetched space dynamics atomically. Wrapping the
+// bulkPut + count recompute + cursor update in one transaction makes this serialize
+// against runM1Sync's transaction (which also locks ups+dynamics), so the two writers
+// can't interleave and clobber each other's updateCount24h.
+async function persistSpaceDynamics(mid: number, items: DynamicRecord[]) {
+  await db.transaction("rw", db.dynamics, db.ups, async () => {
+    if (items.length) {
+      await db.dynamics.bulkPut(items);
+      await recomputeUpdateCount24hForMid(mid);
+    }
+    await db.ups.update(mid, { lastSpaceFetchAt: Date.now() });
+  });
 }
 
 function tryPostMessage(port: chrome.runtime.Port, message: unknown): boolean {
@@ -185,25 +202,24 @@ async function runSpaceSweepBatch() {
   const ups = await db.ups.orderBy("mid").toArray();
   if (ups.length === 0) return;
   const cursorMeta = await db.syncMeta.get("space_sweep_cursor");
-  let cursor = typeof cursorMeta?.value === "number" ? cursorMeta.value : 0;
-  if (cursor >= ups.length) cursor = 0;
-  const batch = ups.slice(cursor, cursor + SPACE_SWEEP_BATCH);
+  // Cursor is the last mid swept, not an array index. ups come back ascending by mid,
+  // so advancing by mid keeps the round-robin stable even when follows are added or
+  // removed between sweeps (an index cursor would skip or repeat UPs after reordering).
+  const lastMid = typeof cursorMeta?.value === "number" ? cursorMeta.value : 0;
+  let batch = ups.filter((up) => up.mid > lastMid).slice(0, SPACE_SWEEP_BATCH);
+  if (batch.length === 0) batch = ups.slice(0, SPACE_SWEEP_BATCH);
   for (const up of batch) {
     try {
       const items = await api.getSpaceDynamics(up.mid);
-      if (items.length) {
-        await db.dynamics.bulkPut(items);
-        await recomputeUpdateCount24hForMid(up.mid);
-      }
-      await db.ups.update(up.mid, { lastSpaceFetchAt: Date.now() });
+      await persistSpaceDynamics(up.mid, items);
     } catch {
       // single UP failure shouldn't abort the sweep
     }
   }
-  cursor += batch.length;
-  if (cursor >= ups.length) cursor = 0;
+  const lastInBatch = batch[batch.length - 1];
+  const nextCursor = lastInBatch ? lastInBatch.mid : 0;
   const now = Date.now();
-  await db.syncMeta.put({ key: "space_sweep_cursor", value: cursor, updatedAt: now });
+  await db.syncMeta.put({ key: "space_sweep_cursor", value: nextCursor, updatedAt: now });
   await db.syncMeta.put({ key: "space_sweep_last_run", value: now, updatedAt: now });
 }
 
@@ -276,4 +292,12 @@ async function getQuadrantState() {
 async function getSettings(): Promise<Settings> {
   const { settings } = await chrome.storage.sync.get("settings");
   return { ...DEFAULT_SETTINGS, ...(settings ?? {}) };
+}
+
+async function ensureAlarms() {
+  const existing = await chrome.alarms.getAll();
+  const names = new Set(existing.map((alarm) => alarm.name));
+  if (!names.has("bili-groups-sync")) chrome.alarms.create("bili-groups-sync", { periodInMinutes: 60 });
+  if (!names.has("bili-groups-quadrants")) chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
+  if (!names.has("bili-groups-space-sweep")) chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
 }

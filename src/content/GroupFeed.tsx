@@ -48,6 +48,11 @@ export function GroupFeed({
     setHasMore(true);
     setProgress({ completed: 0, total: 0, fresh: 0, skipped: 0 });
 
+    // Guard against out-of-order responses: switching tabs re-runs this effect and
+    // cleanup flips `active` to false, so a slow in-flight response from the previous
+    // tab can no longer overwrite the current tab's state.
+    let active = true;
+
     const baseRequest = (extras: { limit: number; before?: number }) => {
       const payload: { type: "feed:get"; mids: number[]; limit: number; before?: number; typeFilter?: TypeFilter } = {
         type: "feed:get",
@@ -61,47 +66,55 @@ export function GroupFeed({
 
     sendRuntimeMessage<DynamicRecord[]>(baseRequest({ limit: FEED_PAGE_SIZE }))
       .then((data) => {
+        if (!active) return;
         setItems(data);
         setHasMore(data.length === FEED_PAGE_SIZE);
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
 
     const port = chrome.runtime.connect({ name: "group-feed" });
     port.postMessage({ type: "start", mids });
     const refetch = () => {
       const limit = Math.max(FEED_PAGE_SIZE, itemCountRef.current);
       void sendRuntimeMessage<DynamicRecord[]>(baseRequest({ limit })).then((fresh) => {
+        if (!active) return;
         setItems(fresh);
         setHasMore(fresh.length === limit);
       });
     };
-    port.onMessage.addListener(
-      (msg: {
-        type: string;
-        completed?: number;
-        total?: number;
-        fresh?: number;
-        skipped?: number;
-        error?: string;
-      }) => {
-        if (msg.type === "progress" && typeof msg.completed === "number" && typeof msg.total === "number") {
-          setProgress({
-            completed: msg.completed,
-            total: msg.total,
-            fresh: msg.fresh ?? 0,
-            skipped: msg.skipped ?? 0
-          });
-          refetch();
-        } else if (msg.type === "done") {
-          setProgress(null);
-          refetch();
-        } else if (msg.type === "warn" && msg.error) {
-          setError(msg.error);
-        }
+    const onPortMessage = (msg: {
+      type: string;
+      completed?: number;
+      total?: number;
+      fresh?: number;
+      skipped?: number;
+      error?: string;
+    }) => {
+      if (!active) return;
+      if (msg.type === "progress" && typeof msg.completed === "number" && typeof msg.total === "number") {
+        setProgress({
+          completed: msg.completed,
+          total: msg.total,
+          fresh: msg.fresh ?? 0,
+          skipped: msg.skipped ?? 0
+        });
+        refetch();
+      } else if (msg.type === "done") {
+        setProgress(null);
+        refetch();
+      } else if (msg.type === "warn" && msg.error) {
+        setError(msg.error);
       }
-    );
+    };
+    port.onMessage.addListener(onPortMessage);
     return () => {
+      active = false;
+      port.onMessage.removeListener(onPortMessage);
       port.disconnect();
     };
   }, [tabKey, mids.length]);
@@ -143,7 +156,7 @@ export function GroupFeed({
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [tabKey]);
+  }, [tabKey, mids.length]);
 
   if (mids.length === 0) {
     return <div class="bdg-feed-state">该分组暂无成员。</div>;

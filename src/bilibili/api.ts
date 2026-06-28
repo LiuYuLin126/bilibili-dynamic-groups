@@ -446,7 +446,7 @@ function extractDynamicMeta(item: Record<string, unknown>, type: DynamicType): P
   if (type === "opus") {
     const opus = asRecord(major.opus);
     const pics = collectPics(major);
-    const firstPic = pics.length ? picUrl(pics[0]) : undefined;
+    const firstPic = picUrl(pics.find((pic) => pic != null));
     setIf(result, "title", optionalString(opus.title));
     setIf(result, "cover", normalizeUrl(firstPic));
     if (pics.length) result.extra = { imageCount: pics.length };
@@ -479,8 +479,10 @@ function collectPics(major: Record<string, unknown>): unknown[] {
     readPath<unknown[]>(major, ["opus", "draw", "items"]),
     readPath<unknown[]>(major, ["images"])
   ];
+  // Pick the first source that actually has a usable item — an array that is non-empty
+  // but holds only null/undefined would otherwise shadow a later source with real pics.
   for (const source of sources) {
-    if (Array.isArray(source) && source.length) return source;
+    if (Array.isArray(source) && source.some((pic) => pic != null)) return source;
   }
   return [];
 }

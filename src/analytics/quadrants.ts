@@ -52,8 +52,11 @@ export function calculateQuadrants(
 }
 
 function resolveQuadrant(viewScore: number, updateScore: number, viewMedian: number, updateMedian: number): QuadrantKey {
-  const frequentView = viewScore >= viewMedian;
-  const frequentUpdate = updateScore >= updateMedian;
+  // Strictly greater than the median: a score equal to the median is not "frequent".
+  // This matters most in the common all-zero case (nobody posted/was viewed → median 0),
+  // where >= would wrongly mark everyone as frequent.
+  const frequentView = viewScore > viewMedian;
+  const frequentUpdate = updateScore > updateMedian;
   if (frequentView && frequentUpdate) return "frequent-view-frequent-update";
   if (frequentView) return "frequent-view-quiet-update";
   if (frequentUpdate) return "quiet-view-frequent-update";
