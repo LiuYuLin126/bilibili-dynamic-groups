@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveGroupMids, type GroupTab } from "@/src/content/domFilter";
 import { GroupFeed } from "@/src/content/GroupFeed";
 import { LiveFeed } from "@/src/content/LiveFeed";
@@ -15,9 +15,27 @@ export default function App() {
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [autoSyncAttempted, setAutoSyncAttempted] = useState(false);
+  const tabsRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void refreshState();
+  }, []);
+
+  // Let a plain mouse wheel scroll the horizontally-overflowing tab strip. Without this
+  // it's only reachable via a trackpad's horizontal swipe (no scrollbar is shown), so
+  // mouse-only users (e.g. on Windows) can't reach tabs past the visible edge. Attached
+  // with passive:false so preventDefault() actually suppresses the page from scrolling.
+  useEffect(() => {
+    const el = tabsRef.current;
+    if (!el) return;
+    const onWheel = (event: WheelEvent) => {
+      if (el.scrollWidth <= el.clientWidth) return; // nothing to scroll
+      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return; // let real horizontal gestures pass through
+      el.scrollLeft += event.deltaY;
+      event.preventDefault();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
   useEffect(() => {
@@ -88,7 +106,7 @@ export default function App() {
   return (
     <section class="bdg-panel" aria-label="Bili Dynamic Groups">
       <div class="bdg-toolbar">
-        <div class="bdg-tabs" role="tablist">
+        <div class="bdg-tabs" role="tablist" ref={tabsRef}>
           <Tab active={activeTab === "all"} label="全部" count={state.ups.length} recent={summary.update24h} onClick={() => setActiveTab("all")} />
           <Tab
             active={activeTab === "live"}
