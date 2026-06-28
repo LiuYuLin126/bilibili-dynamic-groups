@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveGroupMids, type GroupTab } from "@/src/content/domFilter";
 import { GroupFeed } from "@/src/content/GroupFeed";
 import { LiveFeed } from "@/src/content/LiveFeed";
+import { SettingsForm } from "@/src/content/SettingsForm";
 import { sendRuntimeMessage, type Settings, type UiState } from "@/src/shared/messages";
 import { formatCountdown } from "@/src/content/autoRefresh";
 import { formatLogsForReport } from "@/src/storage/logFormat";
@@ -19,6 +20,7 @@ export default function App() {
   const [logExported, setLogExported] = useState(false);
   const [autoSyncAttempted, setAutoSyncAttempted] = useState(false);
   const [syncIntervalMin, setSyncIntervalMin] = useState(60);
+  const [showSettings, setShowSettings] = useState(false);
   const tabsRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -205,8 +207,16 @@ export default function App() {
             <SyncIcon />
             <span>{syncing ? "同步中" : "同步"}</span>
           </button>
+          <button type="button" onClick={() => setShowSettings((open) => !open)} aria-expanded={showSettings}>
+            {showSettings ? "收起设置" : "设置"}
+          </button>
         </div>
       </div>
+      {showSettings ? (
+        <div class="bdg-settings">
+          <SettingsForm onChange={(next) => setSyncIntervalMin(next.syncIntervalMinutes || 60)} />
+        </div>
+      ) : null}
       <div class="bdg-meta">
         <span>{summary.updatedUps} 位有更新</span>
         <span>过去 24 小时 {summary.update24h} 条更新</span>
