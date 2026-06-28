@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { DynamicCard } from "@/src/content/cards";
-import { RefreshStatus, useAutoRefresh } from "@/src/content/autoRefresh";
+import { useAutoRefresh } from "@/src/content/autoRefresh";
 import { sendRuntimeMessage } from "@/src/shared/messages";
 import type { DynamicRecord } from "@/src/types/domain";
 
@@ -199,8 +199,10 @@ export function GroupFeed({
     return () => observer.disconnect();
   }, [tabKey, mids.length]);
 
-  // Tier 1 — cheap local re-read that surfaces whatever the background sweep has added.
-  const localRefresh = useAutoRefresh(softRefresh, LOCAL_REFRESH_MS, mids.length > 0);
+  // Tier 1 — cheap local re-read that silently surfaces whatever the background sweep has
+  // added (new items appear via the pill below; there's no per-group countdown — syncing is
+  // a global action shown in the toolbar).
+  useAutoRefresh(softRefresh, LOCAL_REFRESH_MS, mids.length > 0);
   // Tier 2 — sparser, best-effort network backfill of stale UPs for this group, sent over
   // the live port. If the worker is asleep the local re-read above still keeps the view moving.
   useAutoRefresh(
@@ -234,19 +236,7 @@ export function GroupFeed({
 
   return (
     <div class="bdg-feed">
-      {progress ? (
-        <ProgressBar progress={progress} />
-      ) : (
-        <div class="bdg-feed-meta">
-          <RefreshStatus
-            lastRefreshedAt={localRefresh.lastRefreshedAt}
-            nextRefreshAt={localRefresh.nextRefreshAt}
-            onRefresh={softRefresh}
-            busy={loading}
-          />
-          {error ? <span class="bdg-feed-state--error">{error}</span> : null}
-        </div>
-      )}
+      {progress ? <ProgressBar progress={progress} /> : null}
       {pendingCount > 0 ? (
         <button type="button" class="bdg-newitems" onClick={applyPending}>
           {pendingCount} 条新动态 ↑

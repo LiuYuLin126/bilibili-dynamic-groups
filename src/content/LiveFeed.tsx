@@ -66,7 +66,7 @@ export function LiveFeed() {
         <RefreshStatus
           lastRefreshedAt={fetchedAt}
           nextRefreshAt={refresh.nextRefreshAt}
-          onRefresh={() => void load()}
+          onRefresh={refresh.refreshNow}
           busy={loading}
         />
         {error ? <span class="bdg-feed-state--error">{error}</span> : null}

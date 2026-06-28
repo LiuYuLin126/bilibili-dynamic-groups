@@ -500,6 +500,12 @@
   gap: 8px;
 }
 
+.bdg-sync-status {
+  align-items: center;
+  display: inline-flex;
+  gap: 2px;
+}
+
 .bdg-newitems {
   align-self: center;
   background: #008ac5;

@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveGroupMids, type GroupTab } from "@/src/content/domFilter";
 import { GroupFeed } from "@/src/content/GroupFeed";
 import { LiveFeed } from "@/src/content/LiveFeed";
-import { sendRuntimeMessage, type UiState } from "@/src/shared/messages";
+import { sendRuntimeMessage, type Settings, type UiState } from "@/src/shared/messages";
+import { formatCountdown } from "@/src/content/autoRefresh";
 import { formatLogsForReport } from "@/src/storage/logFormat";
 import type { GroupRecord, RunLogRecord, UpRecord } from "@/src/types/domain";
 
@@ -17,10 +18,31 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [logExported, setLogExported] = useState(false);
   const [autoSyncAttempted, setAutoSyncAttempted] = useState(false);
+  const [syncIntervalMin, setSyncIntervalMin] = useState(60);
   const tabsRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void refreshState();
+  }, []);
+
+  useEffect(() => {
+    void sendRuntimeMessage<Settings>({ type: "settings:get" })
+      .then((settings) => setSyncIntervalMin(settings.syncIntervalMinutes || 60))
+      .catch(() => {});
+  }, []);
+
+  // Reflect background syncs when returning to the tab (refreshes last_sync_at, counts,
+  // and the sync countdown below).
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refreshState();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
   }, []);
 
   // Let a plain mouse wheel scroll the horizontally-overflowing tab strip. Without this
@@ -51,6 +73,7 @@ export default function App() {
   const groupMids = useMemo(() => resolveGroupMids(activeTab, state.ups), [activeTab, state.ups]);
   const savedError = typeof state.meta.last_sync_error === "string" ? state.meta.last_sync_error : "";
   const visibleError = error || savedError;
+  const lastSyncAt = typeof state.meta.last_sync_at === "number" ? state.meta.last_sync_at : null;
 
   async function refreshState() {
     try {
@@ -187,8 +210,13 @@ export default function App() {
       <div class="bdg-meta">
         <span>{summary.updatedUps} 位有更新</span>
         <span>过去 24 小时 {summary.update24h} 条更新</span>
-        {syncing ? <span>正在同步</span> : null}
-        {state.meta.last_sync_at ? <span>{formatTime(Number(state.meta.last_sync_at))}</span> : null}
+        <SyncStatus
+          lastSyncAt={lastSyncAt}
+          intervalMs={Math.max(1, syncIntervalMin) * 60_000}
+          syncing={syncing}
+          syncStatusRunning={state.meta.sync_status === "running"}
+          onDue={() => void syncNow("定时")}
+        />
         <button type="button" class="bdg-meta-btn" onClick={resetCache} title="清空动态缓存，下次进分组会重新拉取">
           重置缓存
         </button>
@@ -231,6 +259,51 @@ function SyncIcon() {
       <path d="M3 12a9 9 0 0 0 15.5 6.3L21 16" />
       <path d="M21 20v-4h-4" />
     </svg>
+  );
+}
+
+// Shows "上次同步 X · 距下次 mm:ss" and drives a real sync when the schedule elapses while
+// the dashboard is open. Owns its own 1s tick so only this node re-renders each second.
+function SyncStatus({
+  lastSyncAt,
+  intervalMs,
+  syncing,
+  syncStatusRunning,
+  onDue
+}: {
+  lastSyncAt: number | null;
+  intervalMs: number;
+  syncing: boolean;
+  syncStatusRunning: boolean;
+  onDue: () => void;
+}) {
+  const [now, setNow] = useState(Date.now());
+  const firedForRef = useRef<number | null>(null);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const nextAt = lastSyncAt ? lastSyncAt + intervalMs : null;
+  const remaining = nextAt ? Math.max(0, Math.round((nextAt - now) / 1000)) : null;
+
+  useEffect(() => {
+    if (!nextAt || syncing || syncStatusRunning) return;
+    if (document.visibilityState !== "visible") return;
+    // Fire once per scheduled time; a successful sync advances lastSyncAt → nextAt, which
+    // re-arms this. A failed sync leaves lastSyncAt unchanged, so it won't spin-retry.
+    if (now >= nextAt && firedForRef.current !== nextAt) {
+      firedForRef.current = nextAt;
+      onDue();
+    }
+  }, [now, nextAt, syncing, syncStatusRunning, onDue]);
+
+  if (syncing) return <span class="bdg-sync-status">正在同步…</span>;
+  return (
+    <span class="bdg-sync-status">
+      {lastSyncAt ? <span>上次同步 {formatTime(lastSyncAt)}</span> : <span>尚未同步</span>}
+      {remaining !== null ? <span> · 距下次同步 {formatCountdown(remaining)}</span> : null}
+    </span>
   );
 }
 
