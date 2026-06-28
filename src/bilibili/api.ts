@@ -40,6 +40,17 @@ const FollowingsData = z.object({
 
 const TagMembersData = z.union([FollowingsData, FollowingsData.shape.list]);
 
+// Constant WebGL/device fingerprint params the web client sends with the space feed.
+// Their exact values don't matter much — Bilibili's -352 risk control mainly checks that
+// they're present and that the request is WBI-signed.
+const DM_FINGERPRINT: Record<string, string> = {
+  dm_img_list: "[]",
+  dm_img_str: "V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ",
+  dm_cover_img_str:
+    "QU5HTEUgKEludGVsLCBJbnRlbChSKSBVSEQgR3JhcGhpY3MgKDB4MDAwMDNFOTIpIChJbnRlbCksIE9wZW5HTCA0LjEpR29vZ2xlIEluYy4gKEludGVsKQ",
+  dm_img_inter: '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}'
+};
+
 export class BilibiliApiClient {
   #wbiKeys?: WbiKeys;
   #lastRequestAt = 0;
@@ -115,8 +126,17 @@ export class BilibiliApiClient {
   }
 
   async getSpaceDynamics(hostMid: number): Promise<DynamicRecord[]> {
-    const query = new URLSearchParams({ host_mid: String(hostMid), timezone_offset: "-480" });
-    const data = await this.requestUnknown(`/x/polymer/web-dynamic/v1/feed/space?${query.toString()}`);
+    // Unlike feed/all, the space feed is risk-controlled (-352) unless the request is
+    // WBI-signed and carries the web client's fingerprint params.
+    const query = await this.signedQuery({
+      host_mid: hostMid,
+      timezone_offset: -480,
+      platform: "web",
+      features: "itemOpusStyle,opusBigCover,onlyfansVote,listOnlyfans",
+      web_location: "333.999",
+      ...DM_FINGERPRINT
+    });
+    const data = await this.requestUnknown(`/x/polymer/web-dynamic/v1/feed/space?${query}`);
     const items = readPath<unknown[]>(data, ["items"]) ?? [];
     return items.map(parseDynamicItem).filter((item): item is DynamicRecord => Boolean(item));
   }
@@ -289,15 +309,23 @@ function summarizeDynamic(item: Record<string, unknown>) {
   const moduleDynamic = readPath(item, ["modules", "module_dynamic"]);
   const desc = readPath(moduleDynamic, ["desc"]);
   const opus = readPath(moduleDynamic, ["major", "opus"]);
+  const major = readPath(moduleDynamic, ["major"]);
   const candidates: Array<string | undefined> = [
-    optionalString(readPath(item, ["modules", "module_dynamic", "major", "archive", "title"])),
-    optionalString(readPath(item, ["modules", "module_dynamic", "major", "article", "title"])),
-    optionalString(readPath(item, ["modules", "module_dynamic", "major", "opus", "title"])),
+    // Text the user actually wrote comes first, then per-major-type titles.
     optionalString(readPath(item, ["modules", "module_dynamic", "desc", "text"])),
     extractRichText(readPath(desc, ["rich_text_nodes"])),
-    optionalString(readPath(item, ["modules", "module_dynamic", "major", "opus", "summary", "text"])),
+    optionalString(readPath(opus, ["summary", "text"])),
     extractRichText(readPath(opus, ["summary", "rich_text_nodes"])),
     optionalString(readPath(opus, ["text"])),
+    optionalString(readPath(opus, ["title"])),
+    optionalString(readPath(major, ["archive", "title"])),
+    optionalString(readPath(major, ["article", "title"])),
+    optionalString(readPath(major, ["pgc", "title"])),
+    optionalString(readPath(major, ["ugc_season", "title"])),
+    optionalString(readPath(major, ["common", "title"])),
+    optionalString(readPath(major, ["common", "desc"])),
+    optionalString(readPath(major, ["music", "title"])),
+    optionalString(readPath(major, ["courses", "title"])),
     deepFindText(opus, 6),
     deepFindText(desc, 6),
     deepFindText(moduleDynamic, 8),
