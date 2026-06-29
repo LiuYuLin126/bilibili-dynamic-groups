@@ -74,13 +74,39 @@ export default defineBackground(() => {
 });
 
 const SPACE_STALE_MS = 30 * 60 * 1000;
-const GROUP_FETCH_MAX = 50;
+const GROUP_FETCH_MAX = 12; // smaller burst on group open — 50 rapid /feed/space calls trips -352
+const SPACE_BLOCK_MS = 15 * 60 * 1000; // after risk control, pause all space fetches this long
+
+// Bilibili risk control on /feed/space surfaces as code -352 or HTTP 412. Once tripped,
+// continuing to hit it only deepens the block, so we stop and cool down. (A plain network
+// "Failed to fetch" is NOT risk control and must not trigger the cooldown.)
+function isRiskControlError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("-352") || message.includes("412") || message.includes("risk control") || message.includes("风控");
+}
+
+async function isSpaceBlocked(): Promise<boolean> {
+  const meta = await db.syncMeta.get("space_block_until");
+  return typeof meta?.value === "number" && Date.now() < meta.value;
+}
+
+async function blockSpace(reason: string) {
+  const until = Date.now() + SPACE_BLOCK_MS;
+  await db.syncMeta.put({ key: "space_block_until", value: until, updatedAt: Date.now() });
+  await logEvent("warn", "risk-control", `命中风控，暂停空间补数 ${Math.round(SPACE_BLOCK_MS / 60000)} 分钟`, reason);
+}
 
 async function runGroupFetch(
   port: chrome.runtime.Port,
   mids: number[],
   isCancelled: () => boolean
 ) {
+  // In a risk-control cooldown: don't fetch (cached content still shows); just stop the bar.
+  if (await isSpaceBlocked()) {
+    tryPostMessage(port, { type: "done", total: 0, fresh: 0, skipped: 0, blocked: true });
+    return;
+  }
+
   const { stale, freshCount } = await planGroupFetch(mids);
   const targets = stale.slice(0, GROUP_FETCH_MAX);
   const total = targets.length;
@@ -104,6 +130,10 @@ async function runGroupFetch(
       const message = error instanceof Error ? error.message : String(error);
       errorSamples.add(message);
       tryPostMessage(port, { type: "warn", mid, error: message });
+      if (isRiskControlError(error)) {
+        await blockSpace(message);
+        break; // stop hammering — further calls only deepen the block
+      }
     }
     completed += 1;
     if (
@@ -226,6 +256,7 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
 const SPACE_SWEEP_BATCH = 5;
 
 async function runSpaceSweepBatch() {
+  if (await isSpaceBlocked()) return; // in a risk-control cooldown; skip this sweep
   const ups = await db.ups.orderBy("mid").toArray();
   if (ups.length === 0) return;
   const cursorMeta = await db.syncMeta.get("space_sweep_cursor");
@@ -245,6 +276,10 @@ async function runSpaceSweepBatch() {
       // single UP failure shouldn't abort the sweep
       errors += 1;
       errorSamples.add(error instanceof Error ? error.message : String(error));
+      if (isRiskControlError(error)) {
+        await blockSpace(error instanceof Error ? error.message : String(error));
+        break; // stop hammering — cool down instead
+      }
     }
   }
   const lastInBatch = batch[batch.length - 1];
