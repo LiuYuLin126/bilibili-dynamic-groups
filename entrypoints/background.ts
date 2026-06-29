@@ -35,10 +35,10 @@ export default defineBackground(() => {
       void runSyncLogged("定时").catch(() => {});
     }
     if (alarm.name === "bili-groups-quadrants") {
-      void runDailyMaintenance();
+      void withKeepAlive(runDailyMaintenance);
     }
     if (alarm.name === "bili-groups-space-sweep") {
-      void runSpaceSweepBatch();
+      void withKeepAlive(runSpaceSweepBatch);
     }
     if (alarm.name === "bili-groups-log-heartbeat") {
       void logHeartbeat();
@@ -318,12 +318,23 @@ const DYNAMICS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
 const DYNAMICS_KEEP_PER_UP = 10;
 const VIEWLOGS_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
 
+// MV3 terminates an idle service worker after ~30s. A full sync runs rate-limited
+// requests for 1-2 minutes; when triggered by an alarm (no open port/message holding the
+// worker alive) it would be killed mid-run, so it never finishes and sync_status sticks at
+// "running". Pinging a chrome API every 20s resets the idle timer for the task's duration.
+function withKeepAlive<T>(work: () => Promise<T>): Promise<T> {
+  const ping = setInterval(() => {
+    void chrome.runtime.getPlatformInfo().catch(() => undefined);
+  }, 20_000);
+  return work().finally(() => clearInterval(ping));
+}
+
 // Wraps the full sync so every run leaves a trail (start / success+counts / failure)
 // in the run log, on top of the existing syncMeta status fields.
 async function runSyncLogged(trigger: string) {
   await logEvent("info", "sync", `同步开始（${trigger}）`);
   try {
-    await runM1Sync(api);
+    await withKeepAlive(() => runM1Sync(api));
     const [ups, groups, dynamics] = await Promise.all([
       db.ups.count(),
       db.groups.count(),

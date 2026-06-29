@@ -72,13 +72,17 @@ export default function App() {
   // Sync once when the dashboard opens if there's no data yet, or if it's gone stale past
   // the configured interval (e.g. the tab/browser was closed while the alarm was idle).
   useEffect(() => {
-    if (autoSyncAttempted || syncing || state.meta.sync_status === "running") return;
+    // Treat a "running" status as stale if it's been stuck for >5 min — that means a prior
+    // background sync was killed mid-run, and we shouldn't let it block a fresh sync.
+    const startedAt = typeof state.meta.sync_started_at === "number" ? state.meta.sync_started_at : 0;
+    const running = state.meta.sync_status === "running" && Date.now() - startedAt < 5 * 60_000;
+    if (autoSyncAttempted || syncing || running) return;
     const last = typeof state.meta.last_sync_at === "number" ? state.meta.last_sync_at : 0;
     const stale = Date.now() - last > Math.max(1, syncIntervalMin) * 60_000;
     if (last && !stale) return; // recent enough; the background alarm keeps it fresh
     setAutoSyncAttempted(true);
     void syncNow(last ? "刷新同步" : "首次同步");
-  }, [autoSyncAttempted, state.meta.last_sync_at, state.meta.sync_status, syncing, syncIntervalMin]);
+  }, [autoSyncAttempted, state.meta.last_sync_at, state.meta.sync_status, state.meta.sync_started_at, syncing, syncIntervalMin]);
 
   const groups = useMemo(() => sortGroups(state.groups, state.ups, sortKey), [state.groups, state.ups, sortKey]);
   const summary = useMemo(() => buildSummary(state.ups), [state.ups]);

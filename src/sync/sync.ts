@@ -6,6 +6,7 @@ import type { DynamicRecord, GroupRecord, UpRecord } from "@/src/types/domain";
 export async function runM1Sync(api: BilibiliApiClient) {
   const startedAt = Date.now();
   await putMeta("sync_status", "running");
+  await putMeta("sync_started_at", startedAt);
 
   try {
     const mid = await api.getCurrentUserMid();
