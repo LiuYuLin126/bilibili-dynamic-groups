@@ -299,6 +299,16 @@ async function getUiState() {
     db.syncMeta.toArray()
   ]);
   const meta = Object.fromEntries(metaRows.map((row) => [row.key, row.value]));
+  // Expose the background sync alarm's real next-fire time so the dashboard countdown
+  // reflects the sleep-proof background schedule rather than a tab-local timer. If the
+  // alarm isn't registered yet (dashboard opened right after a cold start, before
+  // ensureAlarms finished), create it now so the countdown isn't blank.
+  let syncAlarm = await chrome.alarms.get("bili-groups-sync");
+  if (!syncAlarm) {
+    await ensureAlarms();
+    syncAlarm = await chrome.alarms.get("bili-groups-sync");
+  }
+  if (syncAlarm?.scheduledTime) meta.next_sync_at = syncAlarm.scheduledTime;
   return { ups, groups, meta };
 }
 

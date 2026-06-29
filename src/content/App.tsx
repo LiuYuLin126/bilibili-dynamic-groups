@@ -33,17 +33,22 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // Reflect background syncs when returning to the tab (refreshes last_sync_at, counts,
-  // and the sync countdown below).
+  // The background alarm is the source of truth for periodic sync (it survives tab
+  // freeze/discard). The dashboard just reflects it: refresh on wake (a frozen/discarded
+  // tab's own timers stop), and poll while visible so background syncs show up live.
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState === "visible") void refreshState();
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
+    const poll = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshState();
+    }, 60_000);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
+      window.clearInterval(poll);
     };
   }, []);
 
@@ -64,11 +69,16 @@ export default function App() {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
+  // Sync once when the dashboard opens if there's no data yet, or if it's gone stale past
+  // the configured interval (e.g. the tab/browser was closed while the alarm was idle).
   useEffect(() => {
-    if (autoSyncAttempted || syncing || state.meta.last_sync_at || state.meta.sync_status === "running") return;
+    if (autoSyncAttempted || syncing || state.meta.sync_status === "running") return;
+    const last = typeof state.meta.last_sync_at === "number" ? state.meta.last_sync_at : 0;
+    const stale = Date.now() - last > Math.max(1, syncIntervalMin) * 60_000;
+    if (last && !stale) return; // recent enough; the background alarm keeps it fresh
     setAutoSyncAttempted(true);
-    void syncNow("首次同步");
-  }, [autoSyncAttempted, state.meta.last_sync_at, state.meta.sync_status, syncing]);
+    void syncNow(last ? "刷新同步" : "首次同步");
+  }, [autoSyncAttempted, state.meta.last_sync_at, state.meta.sync_status, syncing, syncIntervalMin]);
 
   const groups = useMemo(() => sortGroups(state.groups, state.ups, sortKey), [state.groups, state.ups, sortKey]);
   const summary = useMemo(() => buildSummary(state.ups), [state.ups]);
@@ -76,6 +86,7 @@ export default function App() {
   const savedError = typeof state.meta.last_sync_error === "string" ? state.meta.last_sync_error : "";
   const visibleError = error || savedError;
   const lastSyncAt = typeof state.meta.last_sync_at === "number" ? state.meta.last_sync_at : null;
+  const nextSyncAt = typeof state.meta.next_sync_at === "number" ? state.meta.next_sync_at : null;
 
   async function refreshState() {
     try {
@@ -214,19 +225,18 @@ export default function App() {
       </div>
       {showSettings ? (
         <div class="bdg-settings">
-          <SettingsForm onChange={(next) => setSyncIntervalMin(next.syncIntervalMinutes || 60)} />
+          <SettingsForm
+            onChange={(next) => {
+              setSyncIntervalMin(next.syncIntervalMinutes || 60);
+              void refreshState();
+            }}
+          />
         </div>
       ) : null}
       <div class="bdg-meta">
         <span>{summary.updatedUps} 位有更新</span>
         <span>过去 24 小时 {summary.update24h} 条更新</span>
-        <SyncStatus
-          lastSyncAt={lastSyncAt}
-          intervalMs={Math.max(1, syncIntervalMin) * 60_000}
-          syncing={syncing}
-          syncStatusRunning={state.meta.sync_status === "running"}
-          onDue={() => void syncNow("定时")}
-        />
+        <SyncStatus lastSyncAt={lastSyncAt} nextSyncAt={nextSyncAt} syncing={syncing} onElapsed={() => void refreshState()} />
         <button type="button" class="bdg-meta-btn" onClick={resetCache} title="清空动态缓存，下次进分组会重新拉取">
           重置缓存
         </button>
@@ -274,39 +284,39 @@ function SyncIcon() {
 
 // Shows "上次同步 X · 距下次 mm:ss" and drives a real sync when the schedule elapses while
 // the dashboard is open. Owns its own 1s tick so only this node re-renders each second.
+// Display-only: shows "上次同步 X · 距下次同步 mm:ss" where the countdown targets the
+// background alarm's real next-fire time (state.meta.next_sync_at). It does NOT drive sync
+// — that's the background alarm's job, so it keeps working while this tab is asleep.
 function SyncStatus({
   lastSyncAt,
-  intervalMs,
+  nextSyncAt,
   syncing,
-  syncStatusRunning,
-  onDue
+  onElapsed
 }: {
   lastSyncAt: number | null;
-  intervalMs: number;
+  nextSyncAt: number | null;
   syncing: boolean;
-  syncStatusRunning: boolean;
-  onDue: () => void;
+  onElapsed?: () => void;
 }) {
   const [now, setNow] = useState(Date.now());
-  const firedForRef = useRef<number | null>(null);
+  const lastElapsedFireRef = useRef(0);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
 
-  const nextAt = lastSyncAt ? lastSyncAt + intervalMs : null;
-  const remaining = nextAt ? Math.max(0, Math.round((nextAt - now) / 1000)) : null;
+  const remaining = nextSyncAt ? Math.max(0, Math.round((nextSyncAt - now) / 1000)) : null;
 
+  // When the countdown reaches zero the background alarm has fired and rescheduled — ask
+  // the host to refresh so we pick up the new next-fire time, instead of waiting for the
+  // next 60s poll. Throttled so it retries (at most every 10s) if the first refresh raced
+  // the alarm, but can't spin.
   useEffect(() => {
-    if (!nextAt || syncing || syncStatusRunning) return;
-    if (document.visibilityState !== "visible") return;
-    // Fire once per scheduled time; a successful sync advances lastSyncAt → nextAt, which
-    // re-arms this. A failed sync leaves lastSyncAt unchanged, so it won't spin-retry.
-    if (now >= nextAt && firedForRef.current !== nextAt) {
-      firedForRef.current = nextAt;
-      onDue();
+    if (nextSyncAt && remaining === 0 && now - lastElapsedFireRef.current > 10_000) {
+      lastElapsedFireRef.current = now;
+      onElapsed?.();
     }
-  }, [now, nextAt, syncing, syncStatusRunning, onDue]);
+  }, [remaining, nextSyncAt, now, onElapsed]);
 
   if (syncing) return <span class="bdg-sync-status">正在同步…</span>;
   return (
