@@ -6,6 +6,7 @@ import type { DynamicRecord, GroupRecord, UpRecord } from "@/src/types/domain";
 export async function runM1Sync(api: BilibiliApiClient) {
   const startedAt = Date.now();
   await putMeta("sync_status", "running");
+  await putMeta("sync_started_at", startedAt);
 
   try {
     const mid = await api.getCurrentUserMid();
@@ -29,6 +30,48 @@ export async function runM1Sync(api: BilibiliApiClient) {
     await putMeta("last_sync_error", error instanceof Error ? error.message : String(error));
     throw error;
   }
+}
+
+// Light, frequent sync: only the recent global feed (a few fast requests). This is what
+// actually keeps the dashboard fresh, so it runs every interval — unlike the full sync it
+// finishes well within the service worker's lifetime. The heavy followings/groups refresh
+// (which rarely changes) is left to runM1Sync on a slower cadence.
+export async function runFeedSync(api: BilibiliApiClient) {
+  const startedAt = Date.now();
+  await putMeta("sync_status", "running");
+  await putMeta("sync_started_at", startedAt);
+
+  try {
+    const dynamics = await fetchRecentDynamics(api);
+    await db.transaction("rw", db.ups, db.dynamics, db.syncMeta, async () => {
+      await mergeDynamics(dynamics);
+      await bumpUpLastUpdate(dynamics);
+      await recomputeUpdateCount24h();
+      await putMeta("last_sync_at", startedAt);
+      await putMeta("sync_status", "idle");
+      await putMeta("last_sync_error", "");
+    });
+  } catch (error) {
+    await putMeta("sync_status", "failed");
+    await putMeta("last_sync_error", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
+
+// Bump lastUpdateTs for the UPs that appear in a freshly-fetched feed, so "latest update"
+// group sorting reflects new posts between full syncs (which is what sets it normally).
+async function bumpUpLastUpdate(dynamics: DynamicRecord[]) {
+  const latest = new Map<number, number>();
+  for (const dynamic of dynamics) {
+    latest.set(dynamic.mid, Math.max(latest.get(dynamic.mid) ?? 0, dynamic.pubTs));
+  }
+  if (latest.size === 0) return;
+  const ups = await db.ups.where("mid").anyOf([...latest.keys()]).toArray();
+  const updated = ups.map((up) => ({
+    ...up,
+    lastUpdateTs: Math.max(up.lastUpdateTs, latest.get(up.mid) ?? 0)
+  }));
+  if (updated.length) await db.ups.bulkPut(updated);
 }
 
 async function fetchAllFollowings(api: BilibiliApiClient, mid: number) {

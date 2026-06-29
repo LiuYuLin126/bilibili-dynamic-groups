@@ -8,7 +8,7 @@ import {
   type RuntimeResponse,
   type Settings
 } from "@/src/shared/messages";
-import { runM1Sync } from "@/src/sync/sync";
+import { runFeedSync, runM1Sync } from "@/src/sync/sync";
 import { selectStaleDynamicIds } from "@/src/storage/retention";
 import { getRecentLogs, logEvent, pruneLogs } from "@/src/storage/logs";
 import type { DynamicRecord } from "@/src/types/domain";
@@ -30,15 +30,20 @@ export default defineBackground(() => {
 
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "bili-groups-sync") {
-      // runSyncLogged rethrows for the manual (awaited) path; in the alarm path the
-      // failure is already logged, so swallow it to avoid an unhandled rejection.
-      void runSyncLogged("定时").catch(() => {});
+      // Frequent, light: just refresh the recent feed (fast, finishes within the worker's
+      // lifetime). runSyncLogged rethrows for the manual path; here the failure is already
+      // logged, so swallow it to avoid an unhandled rejection.
+      void runSyncLogged("定时", false).catch(() => {});
+    }
+    if (alarm.name === "bili-groups-full-sync") {
+      // Slow, infrequent: full followings/groups/membership refresh.
+      void runSyncLogged("定时", true).catch(() => {});
     }
     if (alarm.name === "bili-groups-quadrants") {
-      void runDailyMaintenance();
+      void withKeepAlive(runDailyMaintenance);
     }
     if (alarm.name === "bili-groups-space-sweep") {
-      void runSpaceSweepBatch();
+      void withKeepAlive(runSpaceSweepBatch);
     }
     if (alarm.name === "bili-groups-log-heartbeat") {
       void logHeartbeat();
@@ -69,13 +74,39 @@ export default defineBackground(() => {
 });
 
 const SPACE_STALE_MS = 30 * 60 * 1000;
-const GROUP_FETCH_MAX = 50;
+const GROUP_FETCH_MAX = 12; // smaller burst on group open — 50 rapid /feed/space calls trips -352
+const SPACE_BLOCK_MS = 15 * 60 * 1000; // after risk control, pause all space fetches this long
+
+// Bilibili risk control on /feed/space surfaces as code -352 or HTTP 412. Once tripped,
+// continuing to hit it only deepens the block, so we stop and cool down. (A plain network
+// "Failed to fetch" is NOT risk control and must not trigger the cooldown.)
+function isRiskControlError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("-352") || message.includes("412") || message.includes("risk control") || message.includes("风控");
+}
+
+async function isSpaceBlocked(): Promise<boolean> {
+  const meta = await db.syncMeta.get("space_block_until");
+  return typeof meta?.value === "number" && Date.now() < meta.value;
+}
+
+async function blockSpace(reason: string) {
+  const until = Date.now() + SPACE_BLOCK_MS;
+  await db.syncMeta.put({ key: "space_block_until", value: until, updatedAt: Date.now() });
+  await logEvent("warn", "risk-control", `命中风控，暂停空间补数 ${Math.round(SPACE_BLOCK_MS / 60000)} 分钟`, reason);
+}
 
 async function runGroupFetch(
   port: chrome.runtime.Port,
   mids: number[],
   isCancelled: () => boolean
 ) {
+  // In a risk-control cooldown: don't fetch (cached content still shows); just stop the bar.
+  if (await isSpaceBlocked()) {
+    tryPostMessage(port, { type: "done", total: 0, fresh: 0, skipped: 0, blocked: true });
+    return;
+  }
+
   const { stale, freshCount } = await planGroupFetch(mids);
   const targets = stale.slice(0, GROUP_FETCH_MAX);
   const total = targets.length;
@@ -99,6 +130,10 @@ async function runGroupFetch(
       const message = error instanceof Error ? error.message : String(error);
       errorSamples.add(message);
       tryPostMessage(port, { type: "warn", mid, error: message });
+      if (isRiskControlError(error)) {
+        await blockSpace(message);
+        break; // stop hammering — further calls only deepen the block
+      }
     }
     completed += 1;
     if (
@@ -177,7 +212,7 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
     case "state:get":
       return { ok: true, data: await getUiState() };
     case "sync:m1":
-      await runSyncLogged("手动");
+      await runSyncLogged("手动", true);
       return { ok: true, data: await getUiState() };
     case "tracking:view":
       await db.viewLogs.add({ mid: message.mid, ts: Date.now(), source: message.source });
@@ -221,6 +256,7 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
 const SPACE_SWEEP_BATCH = 5;
 
 async function runSpaceSweepBatch() {
+  if (await isSpaceBlocked()) return; // in a risk-control cooldown; skip this sweep
   const ups = await db.ups.orderBy("mid").toArray();
   if (ups.length === 0) return;
   const cursorMeta = await db.syncMeta.get("space_sweep_cursor");
@@ -240,6 +276,10 @@ async function runSpaceSweepBatch() {
       // single UP failure shouldn't abort the sweep
       errors += 1;
       errorSamples.add(error instanceof Error ? error.message : String(error));
+      if (isRiskControlError(error)) {
+        await blockSpace(error instanceof Error ? error.message : String(error));
+        break; // stop hammering — cool down instead
+      }
     }
   }
   const lastInBatch = batch[batch.length - 1];
@@ -299,6 +339,16 @@ async function getUiState() {
     db.syncMeta.toArray()
   ]);
   const meta = Object.fromEntries(metaRows.map((row) => [row.key, row.value]));
+  // Expose the background sync alarm's real next-fire time so the dashboard countdown
+  // reflects the sleep-proof background schedule rather than a tab-local timer. If the
+  // alarm isn't registered yet (dashboard opened right after a cold start, before
+  // ensureAlarms finished), create it now so the countdown isn't blank.
+  let syncAlarm = await chrome.alarms.get("bili-groups-sync");
+  if (!syncAlarm) {
+    await ensureAlarms();
+    syncAlarm = await chrome.alarms.get("bili-groups-sync");
+  }
+  if (syncAlarm?.scheduledTime) meta.next_sync_at = syncAlarm.scheduledTime;
   return { ups, groups, meta };
 }
 
@@ -308,20 +358,32 @@ const DYNAMICS_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
 const DYNAMICS_KEEP_PER_UP = 10;
 const VIEWLOGS_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
 
+// MV3 terminates an idle service worker after ~30s. A full sync runs rate-limited
+// requests for 1-2 minutes; when triggered by an alarm (no open port/message holding the
+// worker alive) it would be killed mid-run, so it never finishes and sync_status sticks at
+// "running". Pinging a chrome API every 20s resets the idle timer for the task's duration.
+function withKeepAlive<T>(work: () => Promise<T>): Promise<T> {
+  const ping = setInterval(() => {
+    void chrome.runtime.getPlatformInfo().catch(() => undefined);
+  }, 20_000);
+  return work().finally(() => clearInterval(ping));
+}
+
 // Wraps the full sync so every run leaves a trail (start / success+counts / failure)
 // in the run log, on top of the existing syncMeta status fields.
-async function runSyncLogged(trigger: string) {
-  await logEvent("info", "sync", `同步开始（${trigger}）`);
+async function runSyncLogged(trigger: string, full: boolean) {
+  const label = full ? "全量同步" : "动态同步";
+  await logEvent("info", "sync", `${label}开始（${trigger}）`);
   try {
-    await runM1Sync(api);
+    await withKeepAlive(() => (full ? runM1Sync(api) : runFeedSync(api)));
     const [ups, groups, dynamics] = await Promise.all([
       db.ups.count(),
       db.groups.count(),
       db.dynamics.count()
     ]);
-    await logEvent("info", "sync", `同步完成（${trigger}）`, { ups, groups, dynamics });
+    await logEvent("info", "sync", `${label}完成（${trigger}）`, { ups, groups, dynamics });
   } catch (error) {
-    await logEvent("error", "sync", `同步失败（${trigger}）`, error instanceof Error ? error.message : String(error));
+    await logEvent("error", "sync", `${label}失败（${trigger}）`, error instanceof Error ? error.message : String(error));
     throw error;
   }
 }
@@ -417,6 +479,7 @@ async function ensureAlarms() {
   if (!names.has("bili-groups-sync")) {
     chrome.alarms.create("bili-groups-sync", { periodInMinutes: syncPeriodMinutes(await getSettings()) });
   }
+  if (!names.has("bili-groups-full-sync")) chrome.alarms.create("bili-groups-full-sync", { periodInMinutes: 6 * 60 });
   if (!names.has("bili-groups-quadrants")) chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
   if (!names.has("bili-groups-space-sweep")) chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
   if (!names.has("bili-groups-log-heartbeat")) chrome.alarms.create("bili-groups-log-heartbeat", { periodInMinutes: 60 });
