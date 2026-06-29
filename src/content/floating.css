@@ -15,7 +15,9 @@
   padding: 10px 16px;
   position: fixed;
   right: 24px;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  transition: box-shadow 0.15s ease;
+  touch-action: none;
+  user-select: none;
   z-index: 2147483000;
 }
 
