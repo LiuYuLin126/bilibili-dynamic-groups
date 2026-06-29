@@ -8,7 +8,7 @@ import {
   type RuntimeResponse,
   type Settings
 } from "@/src/shared/messages";
-import { runM1Sync } from "@/src/sync/sync";
+import { runFeedSync, runM1Sync } from "@/src/sync/sync";
 import { selectStaleDynamicIds } from "@/src/storage/retention";
 import { getRecentLogs, logEvent, pruneLogs } from "@/src/storage/logs";
 import type { DynamicRecord } from "@/src/types/domain";
@@ -30,9 +30,14 @@ export default defineBackground(() => {
 
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "bili-groups-sync") {
-      // runSyncLogged rethrows for the manual (awaited) path; in the alarm path the
-      // failure is already logged, so swallow it to avoid an unhandled rejection.
-      void runSyncLogged("定时").catch(() => {});
+      // Frequent, light: just refresh the recent feed (fast, finishes within the worker's
+      // lifetime). runSyncLogged rethrows for the manual path; here the failure is already
+      // logged, so swallow it to avoid an unhandled rejection.
+      void runSyncLogged("定时", false).catch(() => {});
+    }
+    if (alarm.name === "bili-groups-full-sync") {
+      // Slow, infrequent: full followings/groups/membership refresh.
+      void runSyncLogged("定时", true).catch(() => {});
     }
     if (alarm.name === "bili-groups-quadrants") {
       void withKeepAlive(runDailyMaintenance);
@@ -177,7 +182,7 @@ async function handleMessage(message: RuntimeRequest): Promise<RuntimeResponse> 
     case "state:get":
       return { ok: true, data: await getUiState() };
     case "sync:m1":
-      await runSyncLogged("手动");
+      await runSyncLogged("手动", true);
       return { ok: true, data: await getUiState() };
     case "tracking:view":
       await db.viewLogs.add({ mid: message.mid, ts: Date.now(), source: message.source });
@@ -331,18 +336,19 @@ function withKeepAlive<T>(work: () => Promise<T>): Promise<T> {
 
 // Wraps the full sync so every run leaves a trail (start / success+counts / failure)
 // in the run log, on top of the existing syncMeta status fields.
-async function runSyncLogged(trigger: string) {
-  await logEvent("info", "sync", `同步开始（${trigger}）`);
+async function runSyncLogged(trigger: string, full: boolean) {
+  const label = full ? "全量同步" : "动态同步";
+  await logEvent("info", "sync", `${label}开始（${trigger}）`);
   try {
-    await withKeepAlive(() => runM1Sync(api));
+    await withKeepAlive(() => (full ? runM1Sync(api) : runFeedSync(api)));
     const [ups, groups, dynamics] = await Promise.all([
       db.ups.count(),
       db.groups.count(),
       db.dynamics.count()
     ]);
-    await logEvent("info", "sync", `同步完成（${trigger}）`, { ups, groups, dynamics });
+    await logEvent("info", "sync", `${label}完成（${trigger}）`, { ups, groups, dynamics });
   } catch (error) {
-    await logEvent("error", "sync", `同步失败（${trigger}）`, error instanceof Error ? error.message : String(error));
+    await logEvent("error", "sync", `${label}失败（${trigger}）`, error instanceof Error ? error.message : String(error));
     throw error;
   }
 }
@@ -438,6 +444,7 @@ async function ensureAlarms() {
   if (!names.has("bili-groups-sync")) {
     chrome.alarms.create("bili-groups-sync", { periodInMinutes: syncPeriodMinutes(await getSettings()) });
   }
+  if (!names.has("bili-groups-full-sync")) chrome.alarms.create("bili-groups-full-sync", { periodInMinutes: 6 * 60 });
   if (!names.has("bili-groups-quadrants")) chrome.alarms.create("bili-groups-quadrants", { periodInMinutes: 24 * 60 });
   if (!names.has("bili-groups-space-sweep")) chrome.alarms.create("bili-groups-space-sweep", { periodInMinutes: 10 });
   if (!names.has("bili-groups-log-heartbeat")) chrome.alarms.create("bili-groups-log-heartbeat", { periodInMinutes: 60 });
